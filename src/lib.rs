@@ -227,19 +227,19 @@ fn callback_koopag(hash: u64, mut data: &mut [u8]) -> Option<usize> {
             *param.try_into_mut::<bool>().unwrap() = false;
         }
         if *hash == to_hash40("characall_label_c00") {
-            *param.try_into_mut::<Hash40>().unwrap() = to_hash40("vc_narration_characall_koopa");
+            *param.try_into_mut::<Hash40>().unwrap() = to_hash40("vc_narration_characall_koopag");
         }
         if *hash == to_hash40("disp_order") {
-            *param.try_into_mut::<i8>().unwrap() = 15;
+            *param.try_into_mut::<i8>().unwrap() = 89;
         }
         if *hash == to_hash40("skill_list_order") {
-            *param.try_into_mut::<i8>().unwrap() = 15;
+            *param.try_into_mut::<i8>().unwrap() = 89;
         }
         if *hash == to_hash40("save_no") {
             *param.try_into_mut::<i8>().unwrap() = 0;
         }
         if *hash == to_hash40("characall_label_c00") {
-            *param.try_into_mut::<Hash40>().unwrap() = to_hash40("vc_narration_characall_koopa");
+            *param.try_into_mut::<Hash40>().unwrap() = to_hash40("vc_narration_characall_koopag");
         }
         if *hash == to_hash40("ui_series_id") {
             *param.try_into_mut::<Hash40>().unwrap() = to_hash40("ui_series_mario");
@@ -280,7 +280,7 @@ fn callback_masterhand(hash: u64, mut data: &mut [u8]) -> Option<usize> {
             *param.try_into_mut::<bool>().unwrap() = false;
         }
         if *hash == to_hash40("disp_order") {
-            *param.try_into_mut::<i8>().unwrap() = 118;
+            *param.try_into_mut::<i8>().unwrap() = 87;
         }
         if *hash == to_hash40("skill_list_order") {
             *param.try_into_mut::<i8>().unwrap() = 87;
@@ -333,7 +333,7 @@ fn callback_crazyhand(hash: u64, mut data: &mut [u8]) -> Option<usize> {
             *param.try_into_mut::<bool>().unwrap() = false;
         }
         if *hash == to_hash40("disp_order") {
-            *param.try_into_mut::<i8>().unwrap() = 119;
+            *param.try_into_mut::<i8>().unwrap() = 88;
         }
         if *hash == to_hash40("skill_list_order") {
             *param.try_into_mut::<i8>().unwrap() = 88;
@@ -386,10 +386,10 @@ fn callback_dharkon(hash: u64, mut data: &mut [u8]) -> Option<usize> {
             *param.try_into_mut::<bool>().unwrap() = false;
         }
         if *hash == to_hash40("disp_order") {
-            *param.try_into_mut::<i8>().unwrap() = 120;
+            *param.try_into_mut::<i8>().unwrap() = 96;
         }
         if *hash == to_hash40("skill_list_order") {
-            *param.try_into_mut::<i8>().unwrap() = 89;
+            *param.try_into_mut::<i8>().unwrap() = 96;
         }
         if *hash == to_hash40("save_no") {
             *param.try_into_mut::<i8>().unwrap() = 0;
@@ -439,10 +439,10 @@ fn callback_galeem(hash: u64, mut data: &mut [u8]) -> Option<usize> {
             *param.try_into_mut::<bool>().unwrap() = false;
         }
         if *hash == to_hash40("disp_order") {
-            *param.try_into_mut::<i8>().unwrap() = 121;
+            *param.try_into_mut::<i8>().unwrap() = 95;
         }
         if *hash == to_hash40("skill_list_order") {
-            *param.try_into_mut::<i8>().unwrap() = 90;
+            *param.try_into_mut::<i8>().unwrap() = 95;
         }
         if *hash == to_hash40("save_no") {
             *param.try_into_mut::<i8>().unwrap() = 0;
@@ -492,7 +492,7 @@ fn callback_marx(hash: u64, mut data: &mut [u8]) -> Option<usize> {
             *param.try_into_mut::<bool>().unwrap() = false;
         }
         if *hash == to_hash40("disp_order") {
-            *param.try_into_mut::<i8>().unwrap() = 122;
+            *param.try_into_mut::<i8>().unwrap() = 91;
         }
         if *hash == to_hash40("skill_list_order") {
             *param.try_into_mut::<i8>().unwrap() = 91;
@@ -545,7 +545,7 @@ fn callback_ganon(hash: u64, mut data: &mut [u8]) -> Option<usize> {
             *param.try_into_mut::<bool>().unwrap() = false;
         }
         if *hash == to_hash40("disp_order") {
-            *param.try_into_mut::<i8>().unwrap() = 123;
+            *param.try_into_mut::<i8>().unwrap() = 92;
         }
         if *hash == to_hash40("skill_list_order") {
             *param.try_into_mut::<i8>().unwrap() = 92;
@@ -598,10 +598,10 @@ fn callback_dracula(hash: u64, mut data: &mut [u8]) -> Option<usize> {
             *param.try_into_mut::<bool>().unwrap() = false;
         }
         if *hash == to_hash40("disp_order") {
-            *param.try_into_mut::<i8>().unwrap() = 124;
+            *param.try_into_mut::<i8>().unwrap() = 94;
         }
         if *hash == to_hash40("skill_list_order") {
-            *param.try_into_mut::<i8>().unwrap() = 93;
+            *param.try_into_mut::<i8>().unwrap() = 94;
         }
         if *hash == to_hash40("save_no") {
             *param.try_into_mut::<i8>().unwrap() = 0;
@@ -651,10 +651,10 @@ fn callback_galleom(hash: u64, mut data: &mut [u8]) -> Option<usize> {
             *param.try_into_mut::<bool>().unwrap() = false;
         }
         if *hash == to_hash40("disp_order") {
-            *param.try_into_mut::<i8>().unwrap() = 125;
+            *param.try_into_mut::<i8>().unwrap() = 93;
         }
         if *hash == to_hash40("skill_list_order") {
-            *param.try_into_mut::<i8>().unwrap() = 94;
+            *param.try_into_mut::<i8>().unwrap() = 93;
         }
         if *hash == to_hash40("save_no") {
             *param.try_into_mut::<i8>().unwrap() = 0;
@@ -704,10 +704,10 @@ fn callback_rathalos(hash: u64, mut data: &mut [u8]) -> Option<usize> {
             *param.try_into_mut::<bool>().unwrap() = false;
         }
         if *hash == to_hash40("disp_order") {
-            *param.try_into_mut::<i8>().unwrap() = 126;
+            *param.try_into_mut::<i8>().unwrap() = 90;
         }
         if *hash == to_hash40("skill_list_order") {
-            *param.try_into_mut::<i8>().unwrap() = 95;
+            *param.try_into_mut::<i8>().unwrap() = 90;
         }
         if *hash == to_hash40("save_no") {
             *param.try_into_mut::<i8>().unwrap() = 0;
@@ -716,10 +716,10 @@ fn callback_rathalos(hash: u64, mut data: &mut [u8]) -> Option<usize> {
             *param.try_into_mut::<Hash40>().unwrap() = to_hash40("fighter_kind_mario");
         }
         if *hash == to_hash40("characall_label_c00") {
-            *param.try_into_mut::<Hash40>().unwrap() = to_hash40("vc_narration_characall_rathalos");
+            *param.try_into_mut::<Hash40>().unwrap() = to_hash40("vc_narration_characall_lioleus");
         }
         if *hash == to_hash40("ui_series_id") {
-            *param.try_into_mut::<Hash40>().unwrap() = to_hash40("ui_series_smashbros");
+            *param.try_into_mut::<Hash40>().unwrap() = to_hash40("ui_series_monster_hunter");
         }
         if *hash == to_hash40("fighter_type") {
             *param.try_into_mut::<Hash40>().unwrap() = to_hash40("fighter_type_normal");
@@ -757,10 +757,10 @@ fn callback_wolmh(hash: u64, mut data: &mut [u8]) -> Option<usize> {
             *param.try_into_mut::<bool>().unwrap() = true;
         }
         if *hash == to_hash40("disp_order") {
-            *param.try_into_mut::<i8>().unwrap() = 127;
+            *param.try_into_mut::<i8>().unwrap() = 100;
         }
         if *hash == to_hash40("skill_list_order") {
-            *param.try_into_mut::<i8>().unwrap() = 96;
+            *param.try_into_mut::<i8>().unwrap() = 100;
         }
         if *hash == to_hash40("save_no") {
             *param.try_into_mut::<i8>().unwrap() = 0;
