@@ -22,7 +22,7 @@ ALL BOSSES HAVE ONE(1) LIFE
 - Ganon: 600 HP
 - Dracula: 660 HP (Phase 1 dies at 160 HP, Phase 2 dies at 500 HP. If you want to play Dracula in Stamina mode, always play Dracula with above 200 HP, or else he won't reach Phase 2)
 - Rathalos: 600 HP
-- Galleom: 700 HP (Rage at 220 HP)
+- Galleom: 700 HP (Rage at 385 HP)
 - WOL Master Hand: 400 HP
 ```
 
@@ -35,8 +35,6 @@ Make sure you have a modded Switch or emulator, atmosphere, and ARCropolis.
 [Skyline](https://github.com/skyline-dev/skyline/releases)
 
 [NRO Hook](https://github.com/ultimate-research/nro-hook-plugin/releases)
-
-[The CSK Collection](https://gamebanana.com/mods/499008) (You only need the .nro file)
 
 [Guide ARCropolis Mods using Yuzu/Suyu Emulator](https://gamebanana.com/tuts/12827)
 
@@ -187,7 +185,7 @@ This document contains the **full player input mapping** for all playable bosses
 |------|------|
 | Jump | Combo attack *(requires Master Hand)* |
 | Attack | Dig (ground) / Slap (air) |
-| Special | Bomb Attack |
+| Special | Bomb Attack | Combo attack *(requires Master Hand)* |
 | Guard | Teleport |
 | Side + B | Grow Finger |
 | Up + B | Fire Chariot (ground) / Look (air) |

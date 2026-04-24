@@ -1,6 +1,7 @@
 use smash::lib::lua_const::*;
 use smash::app::lua_bind::*;
 use smash::lua2cpp::L2CFighterCommon;
+use smash::app::BattleObjectModuleAccessor;
 use smash::phx::Vector3f;
 use smash::app::ItemKind;
 use smash::app::sv_battle_object;
@@ -87,6 +88,370 @@ unsafe fn store_galeem_runtime(slot: *mut BossCommonRuntime) {
     (*slot).controller_y = CONTROLLER_Y;
 }
 
+pub unsafe fn reset_match_state(entry_id: usize) {
+    let entry = boss_runtime::sanitize_entry_id(entry_id);
+    if crate::debug::enabled()
+        && (BOSS_ID[entry] != 0
+            || HIDDEN_CPU[entry] != 0
+            || DEAD
+            || RESULT_SPAWNED
+            || STOP
+            || EXISTS_PUBLIC)
+    {
+        crate::boss_log!(
+            "[PB][Galeem][Reset] entry={} tracked_id=0x{:x} hidden_cpu=0x{:x} controllable={} stop={} dead={} result_spawned={} exists_public={} jump_start={} angry={} controller=({:.2},{:.2})",
+            entry,
+            BOSS_ID[entry],
+            HIDDEN_CPU[entry],
+            core::ptr::addr_of!(CONTROLLABLE).read(),
+            core::ptr::addr_of!(STOP).read(),
+            core::ptr::addr_of!(DEAD).read(),
+            core::ptr::addr_of!(RESULT_SPAWNED).read(),
+            core::ptr::addr_of!(EXISTS_PUBLIC).read(),
+            core::ptr::addr_of!(JUMP_START).read(),
+            core::ptr::addr_of!(IS_ANGRY).read(),
+            core::ptr::addr_of!(CONTROLLER_X).read(),
+            core::ptr::addr_of!(CONTROLLER_Y).read()
+        );
+    }
+    CONTROLLABLE = true;
+    IS_ANGRY = false;
+    ENTRY_ID = entry;
+    RANDOM_ATTACK = 0;
+    BOSS_ID[entry] = 0;
+    DEAD = false;
+    JUMP_START = false;
+    RESULT_SPAWNED = false;
+    STOP = false;
+    EXISTS_PUBLIC = false;
+    CONTROLLER_X = 0.0;
+    CONTROLLER_Y = 0.0;
+    CONTROL_SPEED_MUL = 1.25;
+    CONTROL_SPEED_MUL_2 = 0.05;
+    HIDDEN_CPU[entry] = 0;
+}
+
+#[inline(always)]
+unsafe fn log_galeem_entry_phase(
+    tag: &str,
+    module_accessor: *mut BattleObjectModuleAccessor,
+    boss_active: bool,
+    stage_one_prepared: bool,
+    stage_two_prepared: bool,
+) {
+    if module_accessor.is_null() || !crate::debug::enabled() {
+        return;
+    }
+    let entry = boss_helpers::entry_id(module_accessor).min(7);
+    let tracked_id = BOSS_ID[entry];
+    let hidden_cpu_id = HIDDEN_CPU[entry];
+    let tracked_active = boss_active;
+    let tracked_status = if tracked_active {
+        let tracked_boma = sv_battle_object::module_accessor(tracked_id);
+        if tracked_boma.is_null() {
+            -1
+        } else {
+            StatusModule::status_kind(tracked_boma)
+        }
+    } else {
+        -1
+    };
+    let hidden_cpu_active = hidden_cpu_id != 0 && sv_battle_object::is_active(hidden_cpu_id);
+    let hidden_cpu_status = if hidden_cpu_active {
+        let hidden_cpu_boma = sv_battle_object::module_accessor(hidden_cpu_id);
+        if hidden_cpu_boma.is_null() {
+            -1
+        } else {
+            StatusModule::status_kind(hidden_cpu_boma)
+        }
+    } else {
+        -1
+    };
+    crate::boss_log!(
+        "[PB][Galeem][Phase] tag={} entry={} stage=0x{:x} ready_go={} fighter_status={} frame={:.2} scale={:.4} tracked_id=0x{:x} tracked_active={} tracked_status={} hidden_cpu=0x{:x} hidden_cpu_active={} hidden_cpu_status={} stage1={} stage2={} exists_public={} controllable={} dead={} stop={} result_spawned={}",
+        tag,
+        entry,
+        smash::app::stage::get_stage_id(),
+        sv_information::is_ready_go(),
+        StatusModule::status_kind(module_accessor),
+        MotionModule::frame(module_accessor),
+        ModelModule::scale(module_accessor),
+        tracked_id,
+        tracked_active,
+        tracked_status,
+        hidden_cpu_id,
+        hidden_cpu_active,
+        hidden_cpu_status,
+        stage_one_prepared,
+        stage_two_prepared,
+        core::ptr::addr_of!(EXISTS_PUBLIC).read(),
+        core::ptr::addr_of!(CONTROLLABLE).read(),
+        core::ptr::addr_of!(DEAD).read(),
+        core::ptr::addr_of!(STOP).read(),
+        core::ptr::addr_of!(RESULT_SPAWNED).read()
+    );
+}
+
+#[inline(always)]
+unsafe fn log_galeem_spawn_state(
+    tag: &str,
+    module_accessor: *mut BattleObjectModuleAccessor,
+    boss_boma: *mut BattleObjectModuleAccessor,
+) {
+    if module_accessor.is_null() || !crate::debug::enabled() {
+        return;
+    }
+    let entry = boss_helpers::entry_id(module_accessor).min(7);
+    let hidden_cpu_id = HIDDEN_CPU[entry];
+    let hidden_cpu_active = hidden_cpu_id != 0 && sv_battle_object::is_active(hidden_cpu_id);
+    let hidden_cpu_boma = if hidden_cpu_active {
+        sv_battle_object::module_accessor(hidden_cpu_id)
+    } else {
+        std::ptr::null_mut()
+    };
+    let hidden_cpu_status = if hidden_cpu_boma.is_null() {
+        -1
+    } else {
+        StatusModule::status_kind(hidden_cpu_boma)
+    };
+    let boss_status = if boss_boma.is_null() {
+        -1
+    } else {
+        StatusModule::status_kind(boss_boma)
+    };
+    crate::boss_log!(
+        "[PB][Galeem][SpawnState] tag={} entry={} stage=0x{:x} ready_go={} host_status={} host_scale={:.4} host_pos=({:.2},{:.2},{:.2}) tracked_id=0x{:x} boss_status={} boss_pos=({:.2},{:.2},{:.2}) hidden_cpu=0x{:x} hidden_cpu_active={} hidden_cpu_status={} hidden_pos=({:.2},{:.2},{:.2})",
+        tag,
+        entry,
+        smash::app::stage::get_stage_id(),
+        sv_information::is_ready_go(),
+        StatusModule::status_kind(module_accessor),
+        ModelModule::scale(module_accessor),
+        PostureModule::pos_x(module_accessor),
+        PostureModule::pos_y(module_accessor),
+        PostureModule::pos_z(module_accessor),
+        BOSS_ID[entry],
+        boss_status,
+        if boss_boma.is_null() { 0.0 } else { PostureModule::pos_x(boss_boma) },
+        if boss_boma.is_null() { 0.0 } else { PostureModule::pos_y(boss_boma) },
+        if boss_boma.is_null() { 0.0 } else { PostureModule::pos_z(boss_boma) },
+        hidden_cpu_id,
+        hidden_cpu_active,
+        hidden_cpu_status,
+        if hidden_cpu_boma.is_null() { 0.0 } else { PostureModule::pos_x(hidden_cpu_boma) },
+        if hidden_cpu_boma.is_null() { 0.0 } else { PostureModule::pos_y(hidden_cpu_boma) },
+        if hidden_cpu_boma.is_null() { 0.0 } else { PostureModule::pos_z(hidden_cpu_boma) }
+    );
+}
+
+#[inline(always)]
+unsafe fn restore_galeem_after_item_wipe(
+    module_accessor: *mut BattleObjectModuleAccessor,
+) {
+    if module_accessor.is_null()
+    || !sv_information::is_ready_go()
+    || DEAD {
+        return;
+    }
+
+    let entry = boss_runtime::sanitize_entry_id(boss_helpers::entry_id(module_accessor));
+    ENTRY_ID = entry;
+    let tracked_id = BOSS_ID[entry];
+    let hidden_cpu_id = HIDDEN_CPU[entry];
+    let tracked_active = tracked_id != 0 && sv_battle_object::is_active(tracked_id);
+    let hidden_cpu_active = hidden_cpu_id != 0 && sv_battle_object::is_active(hidden_cpu_id);
+    if tracked_active && hidden_cpu_active {
+        return;
+    }
+
+    ItemModule::remove_all(module_accessor);
+    ItemModule::have_item(module_accessor, ItemKind(*ITEM_KIND_DRACULA2), 0, 0, false, false);
+    SoundModule::stop_se(module_accessor, smash::phx::Hash40::new("se_item_item_get"), 0);
+    HIDDEN_CPU[entry] = ItemModule::get_have_item_id(module_accessor, 0) as u32;
+    let hidden_cpu_boma = sv_battle_object::module_accessor(HIDDEN_CPU[entry]);
+    if hidden_cpu_boma.is_null() {
+        return;
+    }
+    ModelModule::set_scale(hidden_cpu_boma, 0.0001);
+    ItemModule::throw_item(module_accessor, 0.0, 0.0, 0.0, 0, true, 0.0);
+
+    let hidden_cpu_id = HIDDEN_CPU[entry];
+    let boss_boma = boss_helpers::acquire_boss_item_excluding(
+        module_accessor,
+        &raw mut BOSS_ID,
+        *ITEM_KIND_KIILA,
+        hidden_cpu_id,
+    );
+    let get_boss_intensity = CONFIG.options.boss_difficulty.unwrap_or(10.0);
+    WorkModule::set_float(boss_boma, get_boss_intensity, *ITEM_INSTANCE_WORK_FLOAT_LEVEL);
+    WorkModule::set_float(boss_boma, 1.0, *ITEM_INSTANCE_WORK_FLOAT_STRENGTH);
+    WorkModule::set_float(boss_boma, 999.0, *ITEM_INSTANCE_WORK_FLOAT_HP_MAX);
+    WorkModule::set_float(boss_boma, 999.0, *ITEM_INSTANCE_WORK_FLOAT_HP);
+    WorkModule::set_int(boss_boma, *ITEM_VARIATION_KIILA_DARZ, *ITEM_INSTANCE_WORK_INT_VARIATION);
+    ModelModule::set_scale(module_accessor, 0.0001);
+    let boss_pos = Vector3f {
+        x: PostureModule::pos_x(module_accessor),
+        y: PostureModule::pos_y(module_accessor),
+        z: PostureModule::pos_z(module_accessor),
+    };
+    PostureModule::set_pos(boss_boma, &boss_pos);
+    PostureModule::set_pos(hidden_cpu_boma, &boss_pos);
+    DamageModule::set_damage_lock(hidden_cpu_boma, true);
+    JostleModule::set_status(hidden_cpu_boma, false);
+    WorkModule::set_float(hidden_cpu_boma, 0.0, *ITEM_INSTANCE_WORK_FLOAT_LEVEL);
+    WorkModule::set_float(hidden_cpu_boma, 0.0, *ITEM_INSTANCE_WORK_FLOAT_STRENGTH);
+    WorkModule::set_float(hidden_cpu_boma, 999.0, *ITEM_INSTANCE_WORK_FLOAT_HP_MAX);
+    WorkModule::set_float(hidden_cpu_boma, 999.0, *ITEM_INSTANCE_WORK_FLOAT_HP);
+    if StatusModule::status_kind(hidden_cpu_boma) != *ITEM_STATUS_KIND_NONE {
+        StatusModule::change_status_request_from_script(hidden_cpu_boma, *ITEM_STATUS_KIND_NONE, true);
+    }
+    StatusModule::change_status_request_from_script(
+        boss_boma,
+        *ITEM_KIILA_STATUS_KIND_MANAGER_WAIT,
+        true,
+    );
+    MotionModule::change_motion(
+        boss_boma,
+        smash::phx::Hash40::new("wait"),
+        0.0,
+        1.0,
+        false,
+        0.0,
+        false,
+        false,
+    );
+    EXISTS_PUBLIC = true;
+    RESULT_SPAWNED = false;
+    crate::boss_log!(
+        "[PB][Recover] entry {}: restored Galeem after item wipe tracked_id=0x{:x} hidden_cpu=0x{:x} tracked_active={} hidden_cpu_active={}",
+        entry,
+        BOSS_ID[entry],
+        HIDDEN_CPU[entry],
+        BOSS_ID[entry] != 0 && sv_battle_object::is_active(BOSS_ID[entry]),
+        HIDDEN_CPU[entry] != 0 && sv_battle_object::is_active(HIDDEN_CPU[entry])
+    );
+}
+
+#[inline(always)]
+unsafe fn teardown_galeem_post_match_transition(
+    module_accessor: *mut BattleObjectModuleAccessor,
+) -> bool {
+    if module_accessor.is_null() {
+        return false;
+    }
+
+    let entry = boss_runtime::sanitize_entry_id(boss_helpers::entry_id(module_accessor));
+    let tracked_id = BOSS_ID[entry];
+    let hidden_cpu_id = HIDDEN_CPU[entry];
+    let tracked_active = tracked_id != 0 && sv_battle_object::is_active(tracked_id);
+    let hidden_cpu_active = hidden_cpu_id != 0 && sv_battle_object::is_active(hidden_cpu_id);
+    if !tracked_active && !hidden_cpu_active && !EXISTS_PUBLIC {
+        return false;
+    }
+
+    if tracked_active {
+        let boss_boma = sv_battle_object::module_accessor(tracked_id);
+        if !boss_boma.is_null() {
+            HitModule::set_whole(boss_boma, smash::app::HitStatus(*HIT_STATUS_OFF), 0);
+            SlowModule::clear_whole(boss_boma);
+            StatusModule::change_status_request_from_script(
+                boss_boma,
+                *ITEM_STATUS_KIND_STANDBY,
+                true,
+            );
+        }
+    }
+
+    if hidden_cpu_active {
+        let hidden_cpu_boma = sv_battle_object::module_accessor(hidden_cpu_id);
+        if !hidden_cpu_boma.is_null() {
+            HitModule::set_whole(hidden_cpu_boma, smash::app::HitStatus(*HIT_STATUS_OFF), 0);
+            SlowModule::clear_whole(hidden_cpu_boma);
+            if StatusModule::status_kind(hidden_cpu_boma) != *ITEM_STATUS_KIND_NONE {
+                StatusModule::change_status_request_from_script(
+                    hidden_cpu_boma,
+                    *ITEM_STATUS_KIND_NONE,
+                    true,
+                );
+            }
+        }
+    }
+
+    ItemModule::remove_all(module_accessor);
+    boss_helpers::clear_hidden_host_effects(module_accessor);
+    boss_helpers::stop_hidden_host_mario_result_sfx(module_accessor);
+    ModelModule::set_scale(module_accessor, boss_helpers::HIDDEN_HOST_SCALE);
+    MotionModule::change_motion(
+        module_accessor,
+        smash::phx::Hash40::new("none"),
+        0.0,
+        1.0,
+        false,
+        0.0,
+        false,
+        false,
+    );
+    reset_match_state(entry);
+    CONTROLLABLE = false;
+
+    crate::boss_log!(
+        "[PB][Galeem][Cleanup] entry {}: cleared Galeem runtime on non-ready_go transition tracked_active={} hidden_cpu_active={}",
+        entry,
+        tracked_active,
+        hidden_cpu_active
+    );
+
+    true
+}
+
+#[inline(always)]
+unsafe fn cleanup_galeem_result_state(
+    module_accessor: *mut BattleObjectModuleAccessor,
+) {
+    if module_accessor.is_null() {
+        return;
+    }
+
+    let entry = boss_runtime::sanitize_entry_id(boss_helpers::entry_id(module_accessor));
+    if RESULT_SPAWNED {
+        boss_helpers::stop_hidden_host_mario_result_sfx(module_accessor);
+        return;
+    }
+
+    EXISTS_PUBLIC = false;
+    RESULT_SPAWNED = true;
+    DEAD = false;
+    STOP = false;
+    IS_ANGRY = false;
+    CONTROLLABLE = true;
+    JUMP_START = false;
+    CONTROLLER_X = 0.0;
+    CONTROLLER_Y = 0.0;
+
+    let hidden_cpu_id = HIDDEN_CPU[entry];
+    if hidden_cpu_id != 0 && sv_battle_object::is_active(hidden_cpu_id) {
+        let hidden_cpu_boma = sv_battle_object::module_accessor(hidden_cpu_id);
+        if !hidden_cpu_boma.is_null() {
+            HitModule::set_whole(hidden_cpu_boma, smash::app::HitStatus(*HIT_STATUS_OFF), 0);
+            SlowModule::clear_whole(hidden_cpu_boma);
+            if StatusModule::status_kind(hidden_cpu_boma) != *ITEM_STATUS_KIND_NONE {
+                StatusModule::change_status_request_from_script(
+                    hidden_cpu_boma,
+                    *ITEM_STATUS_KIND_NONE,
+                    true,
+                );
+            }
+        }
+    }
+    HIDDEN_CPU[entry] = 0;
+    boss_helpers::clear_boss_item_slot(module_accessor, &raw mut BOSS_ID, true);
+    boss_helpers::restore_plain_mario_visuals(module_accessor);
+    crate::boss_log!(
+        "[PB][Galeem][ResultCleanup] entry {}: cleared Galeem result state",
+        entry
+    );
+}
+
 extern "C" fn once_per_fighter_frame(fighter: &mut L2CFighterCommon) {
     unsafe {
         let lua_state = fighter.lua_state_agent;
@@ -100,11 +465,22 @@ extern "C" fn once_per_fighter_frame(fighter: &mut L2CFighterCommon) {
                 store_galeem_runtime,
             );
             let fighter_manager = boss_helpers::fighter_manager();
+            if !fighter_manager.is_null() && FighterManager::is_result_mode(fighter_manager) {
+                cleanup_galeem_result_state(module_accessor);
+                return;
+            }
             
             let selected_via_slot = selection::is_selected_css_boss(module_accessor, *ITEM_KIND_KIILA);
+            if !selected_via_slot
+                && !sv_information::is_ready_go()
+                && (BOSS_ID[ENTRY_ID] != 0 || HIDDEN_CPU[ENTRY_ID] != 0 || EXISTS_PUBLIC)
+            {
+                teardown_galeem_post_match_transition(module_accessor);
+                return;
+            }
             if selected_via_slot {
                 boss_helpers::clear_hidden_host_effects(module_accessor);
-                if smash::app::stage::get_stage_id() == 0x139 {
+                if boss_helpers::is_boss_preview_stage(smash::app::stage::get_stage_id()) {
                     let lua_state = fighter.lua_state_agent;
                     let module_accessor = smash::app::sv_system::battle_object_module_accessor(lua_state);
                     if ModelModule::scale(module_accessor) != 0.0001 || !ItemModule::is_have_item(module_accessor, 0) {
@@ -125,14 +501,25 @@ extern "C" fn once_per_fighter_frame(fighter: &mut L2CFighterCommon) {
                         PostureModule::set_pos(module_accessor, &Vector3f{x: PostureModule::pos_x(module_accessor), y: 7.25, z: PostureModule::pos_z(module_accessor) + 3.0});
                     }
                 }
-                else if smash::app::stage::get_stage_id() != 0x13A {
+                else if !boss_helpers::is_boss_passthrough_stage(smash::app::stage::get_stage_id()) {
+                    restore_galeem_after_item_wipe(module_accessor);
                     if sv_information::is_ready_go() == false {
                         let lua_state = fighter.lua_state_agent;
                         let module_accessor = smash::app::sv_system::battle_object_module_accessor(lua_state);
                         ENTRY_ID = WorkModule::get_int(module_accessor, *FIGHTER_INSTANCE_WORK_ID_INT_ENTRY_ID) as usize;
-                        let host_scale = ModelModule::scale(module_accessor);
-                        let spawn_prepared = host_scale == 0.0001;
-                        if !spawn_prepared {
+                        let boss_active =
+                            boss_helpers::is_tracked_boss_active(&raw const BOSS_ID, ENTRY_ID);
+                        let stage_one_prepared = boss_helpers::is_hidden_host_entry_prep(module_accessor);
+                        let stage_two_prepared =
+                            boss_helpers::is_hidden_host_entry_stage_two(module_accessor);
+                        log_galeem_entry_phase(
+                            "pre_ready_go_gate",
+                            module_accessor,
+                            boss_active,
+                            stage_one_prepared,
+                            stage_two_prepared,
+                        );
+                        if !boss_active && !stage_one_prepared && !stage_two_prepared {
                             DEAD = false;
                             CONTROLLABLE = true;
                             JUMP_START = false;
@@ -147,15 +534,35 @@ extern "C" fn once_per_fighter_frame(fighter: &mut L2CFighterCommon) {
                             }
                         }
                         if smash::app::smashball::is_training_mode() == false {
-                            if ModelModule::scale(module_accessor) != 0.0001 && ModelModule::scale(module_accessor) != 0.0002 {
-                                ModelModule::set_scale(module_accessor, 0.0002);
+                            if !boss_active && !stage_one_prepared && !stage_two_prepared {
+                                ModelModule::set_scale(module_accessor, boss_helpers::HIDDEN_HOST_ENTRY_PREP_SCALE);
                                 ItemModule::have_item(module_accessor, ItemKind(*ITEM_KIND_DRACULA2), 0, 0, false, false);
                                 SoundModule::stop_se(module_accessor, smash::phx::Hash40::new("se_item_item_get"), 0);
                                 HIDDEN_CPU[boss_helpers::entry_id(module_accessor)] = ItemModule::get_have_item_id(module_accessor, 0) as u32;
                                 let hidden_cpu_boma = sv_battle_object::module_accessor(HIDDEN_CPU[boss_helpers::entry_id(module_accessor)]);
-                                ModelModule::set_scale(hidden_cpu_boma, 0.0001);
+                                if hidden_cpu_boma.is_null() {
+                                    HIDDEN_CPU[boss_helpers::entry_id(module_accessor)] = 0;
+                                    ModelModule::set_scale(module_accessor, boss_helpers::HIDDEN_HOST_SCALE);
+                                } else {
+                                    ModelModule::set_scale(hidden_cpu_boma, boss_helpers::HIDDEN_HOST_SCALE);
+                                }
+                                log_galeem_entry_phase("stage1_prepare", module_accessor, false, true, false);
                             }
-                            if MotionModule::frame(module_accessor) >= 5.0 && ModelModule::scale(module_accessor) != 0.0001 {
+                            if MotionModule::frame(module_accessor) >= 2.0
+                                && !boss_active
+                                && stage_one_prepared
+                            {
+                                ModelModule::set_scale(
+                                    module_accessor,
+                                    boss_helpers::HIDDEN_HOST_ENTRY_STAGE2_SCALE,
+                                );
+                                log_galeem_entry_phase("stage2_prepare", module_accessor, false, false, true);
+                            }
+                            if MotionModule::frame(module_accessor) >= 5.0
+                                && !boss_active
+                                && boss_helpers::is_hidden_host_entry_stage_two(module_accessor)
+                            {
+                                log_galeem_entry_phase("initial_spawn_start", module_accessor, false, false, true);
                                 DEAD = false;
                                 CONTROLLABLE = true;
                                 JUMP_START = false;
@@ -178,7 +585,7 @@ extern "C" fn once_per_fighter_frame(fighter: &mut L2CFighterCommon) {
                                 let get_boss_intensity = CONFIG.options.boss_difficulty.unwrap_or(10.0);
                                 WorkModule::set_float(boss_boma, get_boss_intensity, *ITEM_INSTANCE_WORK_FLOAT_LEVEL);
                                 WorkModule::set_float(boss_boma, 1.0, *ITEM_INSTANCE_WORK_FLOAT_STRENGTH);
-                                ModelModule::set_scale(module_accessor, 0.0001);
+                                ModelModule::set_scale(module_accessor, boss_helpers::HIDDEN_HOST_SCALE);
                                 if dharkon::check_status() {
                                     // MotionModule::change_motion(boss_boma,smash::phx::Hash40::new("entry2"),0.0,1.0,false,0.0,false,false);
                                     StatusModule::change_status_request_from_script(boss_boma, *ITEM_STATUS_KIND_FOR_BOSS_START, true);
@@ -195,33 +602,58 @@ extern "C" fn once_per_fighter_frame(fighter: &mut L2CFighterCommon) {
                                     BOSS_ID[boss_helpers::entry_id(module_accessor)],
                                     StatusModule::status_kind(boss_boma),
                                 );
+                                log_galeem_spawn_state("initial", module_accessor, boss_boma);
                             }
                         }
                     }
 
                     if sv_information::is_ready_go() == true {
-                        let hidden_cpu_boma = sv_battle_object::module_accessor(HIDDEN_CPU[boss_helpers::entry_id(module_accessor)]);
-                        DamageModule::set_damage_lock(hidden_cpu_boma, true);
-                        JostleModule::set_status(hidden_cpu_boma, false);
-                        WorkModule::set_float(hidden_cpu_boma, 0.0, *ITEM_INSTANCE_WORK_FLOAT_LEVEL);
-                        WorkModule::set_float(hidden_cpu_boma, 0.0, *ITEM_INSTANCE_WORK_FLOAT_STRENGTH);
-                        WorkModule::set_float(hidden_cpu_boma, 999.0, *ITEM_INSTANCE_WORK_FLOAT_HP_MAX);
-                        WorkModule::set_float(hidden_cpu_boma, 999.0, *ITEM_INSTANCE_WORK_FLOAT_HP);
-                        if StatusModule::status_kind(hidden_cpu_boma) != *ITEM_STATUS_KIND_NONE {
-                            StatusModule::change_status_request_from_script(hidden_cpu_boma, *ITEM_STATUS_KIND_NONE, true);
+                        let hidden_cpu_id = HIDDEN_CPU[boss_helpers::entry_id(module_accessor)];
+                        let hidden_cpu_boma = if hidden_cpu_id != 0 && sv_battle_object::is_active(hidden_cpu_id) {
+                            sv_battle_object::module_accessor(hidden_cpu_id)
+                        } else {
+                            std::ptr::null_mut()
+                        };
+                        if !hidden_cpu_boma.is_null() {
+                            DamageModule::set_damage_lock(hidden_cpu_boma, true);
+                            JostleModule::set_status(hidden_cpu_boma, false);
+                            WorkModule::set_float(hidden_cpu_boma, 0.0, *ITEM_INSTANCE_WORK_FLOAT_LEVEL);
+                            WorkModule::set_float(hidden_cpu_boma, 0.0, *ITEM_INSTANCE_WORK_FLOAT_STRENGTH);
+                            WorkModule::set_float(hidden_cpu_boma, 999.0, *ITEM_INSTANCE_WORK_FLOAT_HP_MAX);
+                            WorkModule::set_float(hidden_cpu_boma, 999.0, *ITEM_INSTANCE_WORK_FLOAT_HP);
+                            if StatusModule::status_kind(hidden_cpu_boma) != *ITEM_STATUS_KIND_NONE {
+                                StatusModule::change_status_request_from_script(hidden_cpu_boma, *ITEM_STATUS_KIND_NONE, true);
+                            }
                         }
-                        let boss_boma = sv_battle_object::module_accessor(BOSS_ID[boss_helpers::entry_id(module_accessor)]);
-                        let x = PostureModule::pos_x(boss_boma);
-                        let y = PostureModule::pos_y(boss_boma);
-                        let z = PostureModule::pos_z(boss_boma);
-                        let boss_pos = Vector3f{x: x, y: y, z: z};
-                        PostureModule::set_pos(hidden_cpu_boma, &boss_pos);
+                        let tracked_id = BOSS_ID[boss_helpers::entry_id(module_accessor)];
+                        if tracked_id != 0 && sv_battle_object::is_active(tracked_id) && !hidden_cpu_boma.is_null() {
+                            let boss_boma = sv_battle_object::module_accessor(tracked_id);
+                            if !boss_boma.is_null() {
+                                let x = PostureModule::pos_x(boss_boma);
+                                let y = PostureModule::pos_y(boss_boma);
+                                let z = PostureModule::pos_z(boss_boma);
+                                let boss_pos = Vector3f{x: x, y: y, z: z};
+                                PostureModule::set_pos(hidden_cpu_boma, &boss_pos);
+                            }
+                        }
                     }
 
                     if sv_information::is_ready_go() == true
                     && (smash::app::smashball::is_training_mode() == true
                     || CONFIG.options.boss_respawn.unwrap_or(false)) {
-                        if ModelModule::scale(module_accessor) != 0.0002 && ModelModule::scale(module_accessor) != 0.0001 {
+                        let boss_active =
+                            boss_helpers::is_tracked_boss_active(&raw const BOSS_ID, ENTRY_ID);
+                        let stage_one_prepared = boss_helpers::is_hidden_host_entry_prep(module_accessor);
+                        let stage_two_prepared =
+                            boss_helpers::is_hidden_host_entry_stage_two(module_accessor);
+                        log_galeem_entry_phase(
+                            "ready_go_gate",
+                            module_accessor,
+                            boss_active,
+                            stage_one_prepared,
+                            stage_two_prepared,
+                        );
+                        if !boss_active && !stage_one_prepared && !stage_two_prepared {
                             DEAD = false;
                             CONTROLLABLE = true;
                             JUMP_START = false;
@@ -230,9 +662,18 @@ extern "C" fn once_per_fighter_frame(fighter: &mut L2CFighterCommon) {
                             let lua_state = fighter.lua_state_agent;
                             let module_accessor = smash::app::sv_system::battle_object_module_accessor(lua_state);
                             ENTRY_ID = WorkModule::get_int(module_accessor, *FIGHTER_INSTANCE_WORK_ID_INT_ENTRY_ID) as usize;
-                            ModelModule::set_scale(module_accessor, 0.0002);
+                            ModelModule::set_scale(module_accessor, boss_helpers::HIDDEN_HOST_ENTRY_PREP_SCALE);
+                            log_galeem_entry_phase("ready_go_stage1", module_accessor, false, true, false);
                         }
-                        if ModelModule::scale(module_accessor) == 0.0002 {
+                        if !boss_active && stage_one_prepared {
+                            ModelModule::set_scale(
+                                module_accessor,
+                                boss_helpers::HIDDEN_HOST_ENTRY_STAGE2_SCALE,
+                            );
+                            log_galeem_entry_phase("ready_go_stage2", module_accessor, false, false, true);
+                        }
+                        if !boss_active && stage_two_prepared {
+                            log_galeem_entry_phase("ready_go_spawn_start", module_accessor, false, false, true);
                             RESULT_SPAWNED = false;
                             let boss_boma = boss_helpers::acquire_boss_item(
                                 module_accessor,
@@ -247,13 +688,14 @@ extern "C" fn once_per_fighter_frame(fighter: &mut L2CFighterCommon) {
                             WorkModule::set_float(boss_boma, 999.0, *ITEM_INSTANCE_WORK_FLOAT_HP_MAX);
                             WorkModule::set_float(boss_boma, 999.0, *ITEM_INSTANCE_WORK_FLOAT_HP);
                             WorkModule::set_int(boss_boma, *ITEM_VARIATION_KIILA_DARZ, *ITEM_INSTANCE_WORK_INT_VARIATION);
-                            ModelModule::set_scale(module_accessor, 0.0001);
+                            ModelModule::set_scale(module_accessor, boss_helpers::HIDDEN_HOST_SCALE);
                             StatusModule::change_status_request_from_script(boss_boma, *ITEM_STATUS_KIND_FOR_BOSS_START, true);
                             println!(
                                 "[PB][Galeem][Spawn] ready_go boss_id=0x{:x} status={}",
                                 BOSS_ID[boss_helpers::entry_id(module_accessor)],
                                 StatusModule::status_kind(boss_boma),
                             );
+                            log_galeem_spawn_state("ready_go", module_accessor, boss_boma);
                         }
                     }
 
@@ -278,7 +720,9 @@ extern "C" fn once_per_fighter_frame(fighter: &mut L2CFighterCommon) {
                             SoundModule::stop_se(module_accessor, smash::phx::Hash40::new("se_item_item_get"), 0);
                             HIDDEN_CPU[boss_helpers::entry_id(module_accessor)] = ItemModule::get_have_item_id(module_accessor, 0) as u32;
                             let hidden_cpu_boma = sv_battle_object::module_accessor(HIDDEN_CPU[boss_helpers::entry_id(module_accessor)]);
-                            ModelModule::set_scale(hidden_cpu_boma, 0.0001);
+                            if !hidden_cpu_boma.is_null() {
+                                ModelModule::set_scale(hidden_cpu_boma, 0.0001);
+                            }
                             EXISTS_PUBLIC = true;
                             RESULT_SPAWNED = false;
                             ItemModule::throw_item(fighter.module_accessor, 0.0, 0.0, 0.0, 0, true, 0.0);
@@ -304,6 +748,7 @@ extern "C" fn once_per_fighter_frame(fighter: &mut L2CFighterCommon) {
                                 BOSS_ID[boss_helpers::entry_id(module_accessor)],
                                 StatusModule::status_kind(boss_boma),
                             );
+                            log_galeem_spawn_state("rebirth", module_accessor, boss_boma);
 
                             let x = PostureModule::pos_x(module_accessor);
                             let y = PostureModule::pos_y(boss_boma);
@@ -314,37 +759,43 @@ extern "C" fn once_per_fighter_frame(fighter: &mut L2CFighterCommon) {
                         }
                     }
 
-                    if sv_information::is_ready_go() {
+                    if sv_information::is_ready_go() && BOSS_ID[boss_helpers::entry_id(module_accessor)] != 0
+                    {
                         let boss_boma = sv_battle_object::module_accessor(BOSS_ID[boss_helpers::entry_id(module_accessor)]);
-                        if lua_bind::PostureModule::lr(boss_boma) == -1.0 { // left
-                            let vec3 = Vector3f{x: 0.0, y: 90.0, z: 0.0};
-                            PostureModule::set_rot(boss_boma,&vec3,0);
-                        }
-                        if lua_bind::PostureModule::lr(boss_boma) == 1.0 { // right
-                            let vec3 = Vector3f{x: 0.0, y: -90.0, z: 0.0};
-                            PostureModule::set_rot(boss_boma,&vec3,0);
+                        if !boss_boma.is_null() {
+                            if lua_bind::PostureModule::lr(boss_boma) == -1.0 { // left
+                                let vec3 = Vector3f{x: 0.0, y: 90.0, z: 0.0};
+                                PostureModule::set_rot(boss_boma,&vec3,0);
+                            }
+                            if lua_bind::PostureModule::lr(boss_boma) == 1.0 { // right
+                                let vec3 = Vector3f{x: 0.0, y: -90.0, z: 0.0};
+                                PostureModule::set_rot(boss_boma,&vec3,0);
+                            }
                         }
                     }
 
                     // Flags and new damage stuff
 
-                    if sv_information::is_ready_go() == true {
+                    if sv_information::is_ready_go() == true && BOSS_ID[boss_helpers::entry_id(module_accessor)] != 0
+                    {
                         let boss_boma = sv_battle_object::module_accessor(BOSS_ID[boss_helpers::entry_id(module_accessor)]);
-                        if !JUMP_START {
-                            if DamageModule::damage(module_accessor, 0) > 0.0 {
-                                DamageModule::heal(module_accessor, -999.0, 0);
+                        if !boss_boma.is_null() {
+                            if !JUMP_START {
+                                if DamageModule::damage(module_accessor, 0) > 0.0 {
+                                    DamageModule::heal(module_accessor, -999.0, 0);
+                                }
+                                WorkModule::set_float(boss_boma, 999.0, *ITEM_INSTANCE_WORK_FLOAT_HP);
                             }
-                            WorkModule::set_float(boss_boma, 999.0, *ITEM_INSTANCE_WORK_FLOAT_HP);
-                        }
-                        else if WorkModule::get_float(boss_boma, *ITEM_INSTANCE_WORK_FLOAT_HP) != 999.0 {
-                            let sub_hp = 999.0 - WorkModule::get_float(boss_boma, *ITEM_INSTANCE_WORK_FLOAT_HP);
-                            DamageModule::add_damage(module_accessor, sub_hp, 0);
-                            WorkModule::set_float(boss_boma, 999.0, *ITEM_INSTANCE_WORK_FLOAT_HP);
-                        }
-                        if CONTROLLABLE {
-                            WorkModule::off_flag(boss_boma, *ITEM_INSTANCE_WORK_FLAG_AI_SOON_TO_BE_ATTACK);
-                            WorkModule::off_flag(boss_boma, *ITEM_INSTANCE_WORK_FLAG_BOSS_KEYOFF_BGM);
-                            WorkModule::off_flag(boss_boma, *ITEM_INSTANCE_WORK_FLAG_AI_IS_IN_EFFECT);
+                            else if WorkModule::get_float(boss_boma, *ITEM_INSTANCE_WORK_FLOAT_HP) != 999.0 {
+                                let sub_hp = 999.0 - WorkModule::get_float(boss_boma, *ITEM_INSTANCE_WORK_FLOAT_HP);
+                                DamageModule::add_damage(module_accessor, sub_hp, 0);
+                                WorkModule::set_float(boss_boma, 999.0, *ITEM_INSTANCE_WORK_FLOAT_HP);
+                            }
+                            if CONTROLLABLE {
+                                WorkModule::off_flag(boss_boma, *ITEM_INSTANCE_WORK_FLAG_AI_SOON_TO_BE_ATTACK);
+                                WorkModule::off_flag(boss_boma, *ITEM_INSTANCE_WORK_FLAG_BOSS_KEYOFF_BGM);
+                                WorkModule::off_flag(boss_boma, *ITEM_INSTANCE_WORK_FLAG_AI_IS_IN_EFFECT);
+                            }
                         }
                         JostleModule::set_status(module_accessor, false);
                     }
@@ -387,10 +838,11 @@ extern "C" fn once_per_fighter_frame(fighter: &mut L2CFighterCommon) {
                     }
 
                     if DEAD == false {
-                        if sv_information::is_ready_go() == true {
+                        if sv_information::is_ready_go() == true && BOSS_ID[boss_helpers::entry_id(module_accessor)] != 0
+                        {
                             let boss_boma = sv_battle_object::module_accessor(BOSS_ID[boss_helpers::entry_id(module_accessor)]);
-                            if StatusModule::status_kind(boss_boma) == *ITEM_KIILA_STATUS_KIND_DOWN_LOOP {
-                                
+                            if !boss_boma.is_null() && StatusModule::status_kind(boss_boma) == *ITEM_KIILA_STATUS_KIND_DOWN_LOOP {
+
                                 let stunned = !CONFIG.options.full_stun_duration.unwrap_or(false);
                                 if stunned {
                                     StatusModule::change_status_request_from_script(boss_boma,*ITEM_KIILA_STATUS_KIND_DOWN_END,true);
@@ -403,9 +855,11 @@ extern "C" fn once_per_fighter_frame(fighter: &mut L2CFighterCommon) {
                     if DEAD == false {
                         if sv_information::is_ready_go() == true {
                             // SET POS AND STOPS OUT OF BOUNDS
-                            if ModelModule::scale(module_accessor) == 0.0001 {
+                            if ModelModule::scale(module_accessor) == 0.0001
+                                && boss_helpers::is_tracked_boss_active(&raw const BOSS_ID, ENTRY_ID)
+                            {
                                 let boss_boma = sv_battle_object::module_accessor(BOSS_ID[boss_helpers::entry_id(module_accessor)]);
-                                if FighterUtil::is_hp_mode(module_accessor) == true {
+                                if FighterUtil::is_hp_mode(module_accessor) == true && !boss_boma.is_null() {
                                     if StatusModule::status_kind(module_accessor) == *FIGHTER_STATUS_KIND_DEAD
                                     || StatusModule::status_kind(module_accessor) == 79 {
                                         if DEAD == false {
@@ -577,43 +1031,30 @@ extern "C" fn once_per_fighter_frame(fighter: &mut L2CFighterCommon) {
                         }
                     }
                     
-                    if FighterManager::is_result_mode(fighter_manager) == true {
-                        if RESULT_SPAWNED == false {
-                            EXISTS_PUBLIC = false;
-                            RESULT_SPAWNED = true;
-                            DEAD = false;
-                            STOP = false;
-                            IS_ANGRY = false;
-                            CONTROLLABLE = true;
-                            boss_helpers::clear_boss_item_slot(module_accessor, &raw mut BOSS_ID, true);
-                            // ItemModule::have_item(module_accessor, ItemKind(*ITEM_KIND_KIILA), 0, 0, false, false);
-                            // SoundModule::stop_se(module_accessor, smash::phx::Hash40::new("se_item_item_get"), 0);
-                            // BOSS_ID[boss_helpers::entry_id(module_accessor)] = ItemModule::get_have_item_id(module_accessor, 0) as u32;
-                            // let boss_boma = sv_battle_object::module_accessor(BOSS_ID[boss_helpers::entry_id(module_accessor)]);
-                            // StatusModule::change_status_request_from_script(boss_boma, *ITEM_STATUS_KIND_FOR_BOSS_START,true);
-                        }
-                        boss_helpers::stop_hidden_host_mario_result_sfx(module_accessor);
-                    }
-
-                    if sv_information::is_ready_go() == true {
+                    if sv_information::is_ready_go() == true && BOSS_ID[boss_helpers::entry_id(module_accessor)] != 0
+                    {
                         // DAMAGE MODULES
                         let boss_boma = sv_battle_object::module_accessor(BOSS_ID[boss_helpers::entry_id(module_accessor)]);
                         HitModule::set_whole(module_accessor, smash::app::HitStatus(*HIT_STATUS_OFF), 0);
-                        HitModule::set_whole(boss_boma, smash::app::HitStatus(*HIT_STATUS_NORMAL), 0);
-                        for i in 0..10 {
-                            if AttackModule::is_attack(boss_boma, i, false) {
-                                AttackModule::set_target_category(boss_boma, i, *COLLISION_CATEGORY_MASK_ALL as u32);
+                        if !boss_boma.is_null() {
+                            HitModule::set_whole(boss_boma, smash::app::HitStatus(*HIT_STATUS_NORMAL), 0);
+                            for i in 0..10 {
+                                if AttackModule::is_attack(boss_boma, i, false) {
+                                    AttackModule::set_target_category(boss_boma, i, *COLLISION_CATEGORY_MASK_ALL as u32);
+                                }
                             }
                         }
                         if sv_information::is_ready_go() == true {
                             if FighterUtil::is_hp_mode(module_accessor) == false {
-                                
+
                                 let hp = CONFIG.options.galeem_hp.unwrap_or(400.0);
                                 if JUMP_START && DamageModule::damage(module_accessor, 0) >= hp {
                                     if DEAD == false {
                                         CONTROLLABLE = false;
                                         DEAD = true;
-                                        StatusModule::change_status_request_from_script(boss_boma, *ITEM_STATUS_KIND_DEAD, true);
+                                        if !boss_boma.is_null() {
+                                            StatusModule::change_status_request_from_script(boss_boma, *ITEM_STATUS_KIND_DEAD, true);
+                                        }
                                     }
                                 }
                             }
@@ -624,8 +1065,13 @@ extern "C" fn once_per_fighter_frame(fighter: &mut L2CFighterCommon) {
                         if sv_information::is_ready_go() == true {
                             if DEAD == true {
                                 HitModule::set_whole(module_accessor, smash::app::HitStatus(*HIT_STATUS_OFF), 0);
-                                let boss_boma = sv_battle_object::module_accessor(BOSS_ID[boss_helpers::entry_id(module_accessor)]);
-                                HitModule::set_whole(boss_boma, smash::app::HitStatus(*HIT_STATUS_OFF), 0);
+                                let death_boss_id = BOSS_ID[boss_helpers::entry_id(module_accessor)];
+                                if death_boss_id != 0 && sv_battle_object::is_active(death_boss_id) {
+                                    let death_boss_boma = sv_battle_object::module_accessor(death_boss_id);
+                                    if !death_boss_boma.is_null() {
+                                        HitModule::set_whole(death_boss_boma, smash::app::HitStatus(*HIT_STATUS_OFF), 0);
+                                    }
+                                }
                                 ItemModule::remove_all(module_accessor);
                                 if STOP == false && smash::app::smashball::is_training_mode() == false {
                                     boss_helpers::request_hidden_host_stock_drain(
@@ -643,7 +1089,7 @@ extern "C" fn once_per_fighter_frame(fighter: &mut L2CFighterCommon) {
                             }
                         }
     
-                        if DEAD == true {
+                        if DEAD == true && !boss_boma.is_null() {
                             if sv_information::is_ready_go() == true {
                                 if StatusModule::status_kind(boss_boma) == *ITEM_STATUS_KIND_DEAD || MotionModule::motion_kind(boss_boma) == smash::hash40("dead") {
                                     if StatusModule::status_kind(boss_boma) == *ITEM_STATUS_KIND_STANDBY {
@@ -663,22 +1109,26 @@ extern "C" fn once_per_fighter_frame(fighter: &mut L2CFighterCommon) {
                                 JUMP_START = true;
                                 CONTROLLABLE = false;
                                 DamageModule::heal(module_accessor, -999.0, 0);
-                                if lua_bind::PostureModule::lr(boss_boma) == -1.0 { // left
-                                    let vec3 = Vector3f{x: 0.0, y: 90.0, z: 0.0};
-                                    PostureModule::set_rot(boss_boma,&vec3,0);
+                                if !boss_boma.is_null() {
+                                    if lua_bind::PostureModule::lr(boss_boma) == -1.0 { // left
+                                        let vec3 = Vector3f{x: 0.0, y: 90.0, z: 0.0};
+                                        PostureModule::set_rot(boss_boma,&vec3,0);
+                                    }
+                                    if lua_bind::PostureModule::lr(boss_boma) == 1.0 { // right
+                                        let vec3 = Vector3f{x: 0.0, y: -90.0, z: 0.0};
+                                        PostureModule::set_rot(boss_boma,&vec3,0);
+                                    }
+                                    StatusModule::change_status_request_from_script(boss_boma, *ITEM_KIILA_STATUS_KIND_MANAGER_WAIT, true);
+                                    println!(
+                                        "[PB][Galeem][Spawn] jump_start boss_id=0x{:x} status={}",
+                                        BOSS_ID[boss_helpers::entry_id(module_accessor)],
+                                        StatusModule::status_kind(boss_boma),
+                                    );
+                                    log_galeem_spawn_state("jump_start", module_accessor, boss_boma);
                                 }
-                                if lua_bind::PostureModule::lr(boss_boma) == 1.0 { // right
-                                    let vec3 = Vector3f{x: 0.0, y: -90.0, z: 0.0};
-                                    PostureModule::set_rot(boss_boma,&vec3,0);
-                                }
-                                StatusModule::change_status_request_from_script(boss_boma, *ITEM_KIILA_STATUS_KIND_MANAGER_WAIT, true);
-                                println!(
-                                    "[PB][Galeem][Spawn] jump_start boss_id=0x{:x} status={}",
-                                    BOSS_ID[boss_helpers::entry_id(module_accessor)],
-                                    StatusModule::status_kind(boss_boma),
-                                );
                             }
                         }
+                        if !boss_boma.is_null() {
                         if StatusModule::status_kind(boss_boma) == *ITEM_STATUS_KIND_WAIT {
                             CONTROLLABLE = true;
                             MotionModule::change_motion(boss_boma,smash::phx::Hash40::new("wait"),0.0,1.0,false,0.0,false,false);
@@ -1054,6 +1504,7 @@ extern "C" fn once_per_fighter_frame(fighter: &mut L2CFighterCommon) {
                                 CONTROLLER_Y = 0.0;
                                 StatusModule::change_status_request_from_script(boss_boma, *ITEM_KIILA_STATUS_KIND_CRUSH_DOWN_START, true);
                             }
+                        }
                         }
                     }
                 }
