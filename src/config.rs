@@ -1,8 +1,8 @@
+use once_cell::sync::Lazy;
 use serde::Deserialize;
+use skyline::error::show_error;
 use std::fs;
 use std::process::exit;
-use skyline::error::show_error;
-use once_cell::sync::Lazy;
 
 #[derive(Deserialize, Debug)]
 pub struct Options {
@@ -20,8 +20,18 @@ pub struct Options {
     pub boss_difficulty: Option<f32>,
     #[serde(rename = "DEBUG_BOSS_LOGS")]
     pub debug_boss_logs: Option<bool>,
+    #[serde(rename = "DEBUG_AMIIBO_NRO_TRACE")]
+    pub debug_amiibo_nro_trace: Option<bool>,
+    #[serde(rename = "DEBUG_AMIIBO_NRO_SYMBOLS")]
+    pub debug_amiibo_nro_symbols: Option<bool>,
     #[serde(rename = "DETECT_CHARACTER_NAME")]
     pub detect_character_name: Option<bool>,
+    /// Exposes the item-backed bosses through one consolidated `BOSSES` CSS
+    /// entry instead of one row per boss. Defaults to false, which preserves
+    /// the existing per-boss CSS behavior exactly. Giga Bowser remains a
+    /// separate fighter; Galleom is the Ganon color's secondary choice.
+    #[serde(rename = "CONDENSE_BOSSES_INTO_SINGLE_SLOT")]
+    pub condense_bosses_into_single_slot: Option<bool>,
 
     #[serde(rename = "MASTER_HAND_CSS")]
     pub master_hand_css: Option<bool>,
@@ -93,6 +103,13 @@ pub struct Options {
     pub galleom_rage_hp: Option<f32>,
 }
 
+impl Options {
+    #[inline]
+    pub fn condense_bosses_into_single_slot(&self) -> bool {
+        self.condense_bosses_into_single_slot.unwrap_or(false)
+    }
+}
+
 #[derive(Deserialize, Debug)]
 pub struct Config {
     pub options: Options,
@@ -114,9 +131,9 @@ fn find_config_path() -> Option<String> {
 
                 if fs::metadata(&candidate).is_ok() {
                     if dir_name.contains("boss") || dir_name.contains("comp_boss") {
-                        preferred.push(candidate.clone());
+                        preferred.push(candidate);
                     } else {
-                        others.push(candidate.clone());
+                        others.push(candidate);
                     }
                 }
             }
@@ -175,10 +192,7 @@ pub fn load_config() -> Config {
             show_error(
                 0x02,
                 "Failed to parse config.toml",
-                &format!(
-                    "TOML parse error: {}\nCheck formatting at:\n{}",
-                    e, path
-                ),
+                &format!("TOML parse error: {}\nCheck formatting at:\n{}", e, path),
             );
             exit(0);
         }),
@@ -186,10 +200,7 @@ pub fn load_config() -> Config {
             show_error(
                 0x01,
                 "Unreadable config.toml for Competitive Playable Bosses",
-                &format!(
-                    "Error: {}\nTried to read:\n{}",
-                    e, path
-                ),
+                &format!("Error: {}\nTried to read:\n{}", e, path),
             );
             exit(0);
         }
@@ -197,3 +208,43 @@ pub fn load_config() -> Config {
 }
 
 pub static CONFIG: Lazy<Config> = Lazy::new(load_config);
+
+/// Directory the active `config.toml` was loaded from, resolved once. Sibling
+/// plugin state (such as the persisted boss selection) lives beside it so it
+/// follows whichever mod folder the user actually installed.
+pub static CONFIG_DIR: Lazy<Option<String>> = Lazy::new(|| {
+    let path = find_config_path()?;
+    let cut = path.rfind('/')?;
+    Some(path[..cut].to_string())
+});
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn condensed_mode_defaults_off_when_omitted() {
+        let config: Config = toml::from_str("[options]\n").expect("minimal config should parse");
+        assert!(!config.options.condense_bosses_into_single_slot());
+    }
+
+    #[test]
+    fn condensed_mode_parses_both_explicit_values() {
+        let enabled: Config =
+            toml::from_str("[options]\nCONDENSE_BOSSES_INTO_SINGLE_SLOT = true\n")
+                .expect("enabled condensed config should parse");
+        let disabled: Config =
+            toml::from_str("[options]\nCONDENSE_BOSSES_INTO_SINGLE_SLOT = false\n")
+                .expect("disabled condensed config should parse");
+
+        assert!(enabled.options.condense_bosses_into_single_slot());
+        assert!(!disabled.options.condense_bosses_into_single_slot());
+    }
+
+    #[test]
+    fn distributed_config_keeps_condensed_mode_disabled_by_default() {
+        let distributed = include_str!("../ultimate/mods/Bosses/config.toml");
+        let config: Config = toml::from_str(distributed).expect("distributed config should parse");
+        assert!(!config.options.condense_bosses_into_single_slot());
+    }
+}
