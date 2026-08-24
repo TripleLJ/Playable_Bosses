@@ -2735,13 +2735,13 @@ fn callback_koopag(hash: u64, mut data: &mut [u8]) -> Option<usize> {
     patch_bool_field(&mut target_row, to_hash40("can_select"), true);
     patch_bool_field(&mut target_row, to_hash40("is_boss"), true);
     patch_bool_field(&mut target_row, to_hash40("is_hidden_boss"), false);
-    patch_i8_field(&mut target_row, to_hash40("disp_order"), 15);
-    patch_i8_field(&mut target_row, to_hash40("skill_list_order"), 15);
+    patch_i8_field(&mut target_row, to_hash40("disp_order"), 89);
+    patch_i8_field(&mut target_row, to_hash40("skill_list_order"), 89);
     patch_i8_field(&mut target_row, to_hash40("save_no"), -1);
     patch_hash40_field(
         &mut target_row,
         to_hash40("characall_label_c00"),
-        to_hash40("vc_narration_characall_koopa"),
+        to_hash40("vc_narration_characall_koopag"),
     );
     patch_hash40_field(
         &mut target_row,
@@ -3428,7 +3428,7 @@ fn callback_wolmh(hash: u64, mut data: &mut [u8]) -> Option<usize> {
             *param.try_into_mut::<bool>().unwrap() = true;
         }
         if *hash == to_hash40("disp_order") {
-            *param.try_into_mut::<i8>().unwrap() = 100;
+            *param.try_into_mut::<i8>().unwrap() = -1;
         }
         if *hash == to_hash40("skill_list_order") {
             *param.try_into_mut::<i8>().unwrap() = 100;
