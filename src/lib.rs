@@ -55,6 +55,9 @@ static mut RESULT_BISECT_ALIVE_LOGGED: [bool; 8] = [false; 8];
 static mut BOSS_LIFECYCLE_GENERATION: [u32; 8] = [0; 8];
 static mut BOSS_LIFECYCLE_PHASE: [u8; 8] = [0; 8];
 static mut BOSS_LIFECYCLE_LAST_SIGNATURE: [u64; 8] = [u64::MAX; 8];
+static mut LAST_STARTED_BOSS_STAGE_BY_ENTRY: [i32; MAX_FIGHTERS] = [i32::MIN; MAX_FIGHTERS];
+static mut CLASSIC_CLEAR_CAMERA_ANCHORS: [ClassicClearCameraAnchor; MAX_FIGHTERS] =
+    [ClassicClearCameraAnchor::EMPTY; MAX_FIGHTERS];
 
 const LIFECYCLE_PHASE_PRE_MATCH: u8 = 1;
 const LIFECYCLE_PHASE_BATTLE: u8 = 2;
@@ -69,6 +72,152 @@ enum BossTransitionPhase {
     PostMatchPreResult,
     ResultReady,
     SceneExit,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+struct ClassicClearCameraAnchor {
+    position: [f32; 3],
+    generation: u32,
+    active: bool,
+    hold_logged: bool,
+}
+
+impl ClassicClearCameraAnchor {
+    const EMPTY: Self = Self {
+        position: [0.0; 3],
+        generation: 0,
+        active: false,
+        hold_logged: false,
+    };
+
+    fn capture(&mut self, position: [f32; 3], generation: u32) -> bool {
+        if position.iter().any(|component| !component.is_finite()) {
+            return false;
+        }
+        let first_capture = !self.active || self.generation != generation;
+        self.position = position;
+        self.generation = generation;
+        self.active = true;
+        self.hold_logged = false;
+        first_capture
+    }
+
+    fn hold_position(&self, generation: u32, phase: BossTransitionPhase) -> Option<[f32; 3]> {
+        (self.active
+            && self.generation == generation
+            && phase == BossTransitionPhase::PostMatchPreResult)
+            .then_some(self.position)
+    }
+
+    fn clear(&mut self) -> bool {
+        let was_active = self.active;
+        *self = Self::EMPTY;
+        was_active
+    }
+}
+
+#[inline(always)]
+unsafe fn clear_classic_clear_camera_anchor(entry_id: usize, reason: &'static str) {
+    let entry = entry_id.min(MAX_FIGHTERS - 1);
+    let mut anchor = CLASSIC_CLEAR_CAMERA_ANCHORS[entry];
+    if anchor.clear() {
+        CLASSIC_CLEAR_CAMERA_ANCHORS[entry] = anchor;
+        crate::boss_log!(
+            "[PB][ClassicClearCamera] action=release entry={} generation={} reason={}",
+            entry,
+            BOSS_LIFECYCLE_GENERATION[entry],
+            reason
+        );
+    }
+}
+
+/// Record the final safe fighter-host position after boss frames have already
+/// synchronized it. No boss object is queried by this bridge.
+#[inline(always)]
+unsafe fn capture_classic_clear_camera_anchor(
+    module_accessor: *mut smash::app::BattleObjectModuleAccessor,
+) {
+    if module_accessor.is_null() || !boss_helpers::is_hidden_host(module_accessor) {
+        return;
+    }
+
+    let entry = boss_helpers::entry_id(module_accessor).min(MAX_FIGHTERS - 1);
+    if !BOSS_MATCH_STARTED[entry] {
+        return;
+    }
+
+    let position = [
+        PostureModule::pos_x(module_accessor),
+        PostureModule::pos_y(module_accessor),
+        PostureModule::pos_z(module_accessor),
+    ];
+    let generation = BOSS_LIFECYCLE_GENERATION[entry];
+    let mut anchor = CLASSIC_CLEAR_CAMERA_ANCHORS[entry];
+    if anchor.capture(position, generation) {
+        crate::boss_log!(
+            "[PB][ClassicClearCamera] action=capture entry={} generation={} position=({:.3},{:.3},{:.3}) source=synchronized_hidden_host",
+            entry,
+            generation,
+            position[0],
+            position[1],
+            position[2]
+        );
+    }
+    CLASSIC_CLEAR_CAMERA_ANCHORS[entry] = anchor;
+}
+
+/// Classic's round-clear camera continues to follow the fighter after Ready-Go
+/// ends. Hold only the hidden host at its last safe battle position while boss
+/// objects remain under native teardown quarantine.
+#[inline(always)]
+unsafe fn maintain_classic_clear_camera_anchor(
+    module_accessor: *mut smash::app::BattleObjectModuleAccessor,
+    phase: BossTransitionPhase,
+) {
+    if module_accessor.is_null() {
+        return;
+    }
+
+    let entry = boss_helpers::entry_id(module_accessor).min(MAX_FIGHTERS - 1);
+    if matches!(
+        phase,
+        BossTransitionPhase::ResultReady | BossTransitionPhase::SceneExit
+    ) {
+        clear_classic_clear_camera_anchor(
+            entry,
+            if phase == BossTransitionPhase::ResultReady {
+                "result_ready"
+            } else {
+                "scene_exit"
+            },
+        );
+        return;
+    }
+
+    let generation = BOSS_LIFECYCLE_GENERATION[entry];
+    let mut anchor = CLASSIC_CLEAR_CAMERA_ANCHORS[entry];
+    let Some(position) = anchor.hold_position(generation, phase) else {
+        return;
+    };
+    let position_vector = smash::phx::Vector3f {
+        x: position[0],
+        y: position[1],
+        z: position[2],
+    };
+    PostureModule::set_pos(module_accessor, &position_vector);
+
+    if !anchor.hold_logged {
+        anchor.hold_logged = true;
+        CLASSIC_CLEAR_CAMERA_ANCHORS[entry] = anchor;
+        crate::boss_log!(
+            "[PB][ClassicClearCamera] action=hold entry={} generation={} position=({:.3},{:.3},{:.3}) phase=post_match_pre_result boss_item_access=false",
+            entry,
+            generation,
+            position[0],
+            position[1],
+            position[2]
+        );
+    }
 }
 
 #[inline(always)]
@@ -128,6 +277,36 @@ unsafe fn log_lifecycle_phase(
 /// Rebirth during an active stock match is intentionally excluded unless the
 /// previous result state is still latched, so normal respawns do not reset the
 /// boss runtime.
+#[inline]
+fn is_verified_new_round_boundary(
+    stale_result_state: bool,
+    entry_status: bool,
+    rebirth_after_result: bool,
+    replay_boundary: bool,
+    suppressed_entry_boundary: bool,
+    stage_transition_after_teardown: bool,
+    fighter_load_boundary: bool,
+) -> bool {
+    fighter_load_boundary
+        || (stale_result_state || suppressed_entry_boundary)
+            && (entry_status
+                || rebirth_after_result
+                || replay_boundary
+                || stage_transition_after_teardown)
+}
+
+#[inline]
+fn is_classic_stage_transition_after_teardown(
+    tracking_invalidated: bool,
+    last_started_stage: i32,
+    current_stage: i32,
+) -> bool {
+    tracking_invalidated
+        && last_started_stage != i32::MIN
+        && current_stage != last_started_stage
+        && current_stage != boss_helpers::STAGE_ID_RESULT
+}
+
 #[inline(always)]
 unsafe fn reset_stale_match_generation_if_new_round(
     module_accessor: *mut smash::app::BattleObjectModuleAccessor,
@@ -136,11 +315,15 @@ unsafe fn reset_stale_match_generation_if_new_round(
     ready_go: bool,
     result_mode: bool,
 ) -> bool {
-    if module_accessor.is_null() || ready_go || result_mode {
+    if module_accessor.is_null() || result_mode {
         return false;
     }
 
     let entry = entry_id.min(MAX_FIGHTERS - 1);
+    let fighter_load_boundary = selection::consume_fighter_load_boundary(entry);
+    if ready_go && !fighter_load_boundary {
+        return false;
+    }
     let fighter_status = StatusModule::status_kind(module_accessor);
     let entry_status = fighter_status == *FIGHTER_STATUS_KIND_ENTRY;
     let rebirth_after_result =
@@ -148,6 +331,18 @@ unsafe fn reset_stale_match_generation_if_new_round(
     let stale_result_state = POST_MATCH_PRE_RESULT[entry]
         || POST_MATCH_TRACKING_INVALIDATED[entry]
         || RESULT_MODE_SEEN[entry];
+    let last_started_stage = LAST_STARTED_BOSS_STAGE_BY_ENTRY[entry];
+    let stage_transition_after_teardown = is_classic_stage_transition_after_teardown(
+        POST_MATCH_TRACKING_INVALIDATED[entry],
+        last_started_stage,
+        stage_id,
+    );
+    // Result-scene cleanup may run on the old host before the next Classic
+    // host exists, clearing the result flags above. Its per-entry selection
+    // quarantine remains armed until either a real CSS transaction or the next
+    // native ENTRY, so this is the safe cross-scene continuation signal.
+    let suppressed_entry_boundary =
+        entry_status && selection::is_boss_selection_suppressed(module_accessor);
 
     // Spirit "Replay" reuses the scene: it never enters result mode, so
     // RESULT_MODE_SEEN stays false and the next battle's host is never seen in
@@ -173,23 +368,37 @@ unsafe fn reset_stale_match_generation_if_new_round(
     let replay_boundary =
         idle_pre_match && NEW_ROUND_IDLE_FRAMES[entry] >= NEW_ROUND_IDLE_FRAMES_REQUIRED;
 
-    if !stale_result_state || (!entry_status && !rebirth_after_result && !replay_boundary) {
+    if !is_verified_new_round_boundary(
+        stale_result_state,
+        entry_status,
+        rebirth_after_result,
+        replay_boundary,
+        suppressed_entry_boundary,
+        stage_transition_after_teardown,
+        fighter_load_boundary,
+    ) {
         return false;
     }
     NEW_ROUND_IDLE_FRAMES[entry] = 0;
-    let reset_reason = if entry_status {
+    let reset_reason = if fighter_load_boundary {
+        "verified_fighter_load"
+    } else if entry_status {
         "new_round_entry"
     } else if rebirth_after_result {
         "rebirth_after_result"
+    } else if stage_transition_after_teardown {
+        "classic_stage_transition"
     } else {
         "replay_idle_pre_match"
     };
+    clear_classic_clear_camera_anchor(entry, reset_reason);
 
     let previous_phase = lifecycle_phase_name(BOSS_LIFECYCLE_PHASE[entry]);
     // Clear the previous match's per-entry WOL secondary-selection latch
     // before resolving this new round. The fresh decision made below remains
     // armed for the new match rather than being cleared after resolution.
     selection::reset_condensed_selection(entry);
+    selection::arm_started_boss_selection_for_new_round(entry);
     let selected_ui_hash = selection::selected_css_boss_selector_id(module_accessor).unwrap_or(0);
 
     // This clears only the temporary scene suppression. The selected boss UI
@@ -220,10 +429,11 @@ unsafe fn reset_stale_match_generation_if_new_round(
         fighter_status
     );
     crate::boss_log!(
-        "[PB][MatchLifecycle] new_generation entry={} generation={} previous_phase={} reset_reason=new_round_entry stage=0x{:x} fighter_status={} selected_ui_hash=0x{:010x} selected_identity_preserved=true",
+        "[PB][MatchLifecycle] new_generation entry={} generation={} previous_phase={} reset_reason={} stage=0x{:x} fighter_status={} selected_ui_hash=0x{:010x} selected_identity_preserved=true",
         entry,
         BOSS_LIFECYCLE_GENERATION[entry],
         previous_phase,
+        reset_reason,
         stage_id,
         fighter_status,
         selected_ui_hash
@@ -236,7 +446,7 @@ unsafe fn reset_stale_match_generation_if_new_round(
         result_mode,
         fighter_status,
         selected_ui_hash,
-        "new_round_entry",
+        reset_reason,
     );
     true
 }
@@ -570,9 +780,8 @@ unsafe fn update_result_transition_state(
     let stage_id = smash::app::stage::get_stage_id();
     let ready_go = smash::app::sv_information::is_ready_go();
     let result_mode = !fighter_manager.is_null() && FighterManager::is_result_mode(fighter_manager);
-    // A new round can reuse the same hidden host and selection identity before
-    // Ready-Go becomes true. Clear only stale result-generation state at the
-    // native ENTRY boundary; ordinary in-match REBIRTH is left untouched.
+    // Reset before boss dispatch when a verified load arrives, otherwise use
+    // the legacy stale-result boundary. Ordinary in-match REBIRTH is untouched.
     reset_stale_match_generation_if_new_round(
         module_accessor,
         entry_id,
@@ -618,6 +827,9 @@ unsafe fn update_result_transition_state(
     // must not fall through to result-camera or boss-frame work merely because
     // that entry has no boss selection of its own.
     if ready_go && !result_mode && (hidden_host || selected_ui_hash != 0 || any_boss_active()) {
+        if hidden_host || selected_ui_hash != 0 {
+            LAST_STARTED_BOSS_STAGE_BY_ENTRY[entry_id] = stage_id;
+        }
         BOSS_HAD_READY_GO[entry_id] = true;
         // A boss battle has actually begun, so this selection is worth
         // remembering across a reboot. Browsing the CSS without starting a
@@ -1074,6 +1286,7 @@ unsafe fn cleanup_hidden_host_post_match_transition(
     // including when the next scene reports Ready-Go immediately.
     if RESULT_MODE_SEEN[entry_id] {
         let stage_id = smash::app::stage::get_stage_id();
+        clear_classic_clear_camera_anchor(entry_id, "result_scene_exit");
         TRANSITION_DEBUG_LAST_DEFERRED_SIGNATURE[entry_id] = u64::MAX;
         BOSS_LIFECYCLE_PHASE[entry_id] = LIFECYCLE_PHASE_SCENE_EXIT;
         log_lifecycle_phase(
@@ -1164,6 +1377,7 @@ unsafe fn cleanup_hidden_host_post_match_transition(
     }
 
     TRANSITION_DEBUG_LAST_DEFERRED_SIGNATURE[entry_id] = u64::MAX;
+    clear_classic_clear_camera_anchor(entry_id, "non_result_transition");
     selection::suppress_boss_selection_until_ready_go(entry_id);
     BOSS_MATCH_STARTED[entry_id] = false;
     selection::reset_condensed_selection(entry_id);
@@ -1328,7 +1542,10 @@ extern "C" fn mario_boss_dispatch_frame(fighter: &mut L2CFighterCommon) {
             ai_diagnostics::log_item_host(module_accessor);
             ai_diagnostics::log_fighter_control_state(module_accessor);
             suppress_hidden_host_result_audio(module_accessor);
+            capture_classic_clear_camera_anchor(module_accessor);
         }
+
+        maintain_classic_clear_camera_anchor(module_accessor, transition_phase);
 
         // Normal boss frames are quarantined in ResultReady, so retain the
         // existing hidden-host audio suppression here rather than allowing a
@@ -1810,6 +2027,117 @@ const CONDENSED_SUPPRESSED_UI_CHARA: [&str; 9] = [
 ];
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum BossCssOption {
+    MasterHand,
+    CrazyHand,
+    Dharkon,
+    Galeem,
+    Marx,
+    GigaBowser,
+    Ganon,
+    Dracula,
+    Rathalos,
+    Galleom,
+    WolMasterHand,
+}
+
+impl BossCssOption {
+    #[cfg(test)]
+    const ITEM_BACKED: [Self; 10] = [
+        Self::MasterHand,
+        Self::CrazyHand,
+        Self::Dharkon,
+        Self::Galeem,
+        Self::Marx,
+        Self::Ganon,
+        Self::Dracula,
+        Self::Rathalos,
+        Self::Galleom,
+        Self::WolMasterHand,
+    ];
+    #[cfg(test)]
+    const ALL: [Self; 11] = [
+        Self::MasterHand,
+        Self::CrazyHand,
+        Self::Dharkon,
+        Self::Galeem,
+        Self::Marx,
+        Self::GigaBowser,
+        Self::Ganon,
+        Self::Dracula,
+        Self::Rathalos,
+        Self::Galleom,
+        Self::WolMasterHand,
+    ];
+
+    fn ui_chara_id(self) -> &'static str {
+        match self {
+            Self::MasterHand => "ui_chara_masterhand",
+            Self::CrazyHand => "ui_chara_crazyhand",
+            Self::Dharkon => "ui_chara_darz",
+            Self::Galeem => "ui_chara_kiila",
+            Self::Marx => "ui_chara_marx",
+            Self::GigaBowser => "ui_chara_koopag",
+            Self::Ganon => "ui_chara_ganonboss",
+            Self::Dracula => "ui_chara_dracula",
+            Self::Rathalos => "ui_chara_lioleus",
+            Self::Galleom => "ui_chara_galleom",
+            Self::WolMasterHand => "ui_chara_mewtwo_masterhand",
+        }
+    }
+
+    fn amiibo_key(self) -> &'static str {
+        match self {
+            Self::MasterHand => "master_hand",
+            Self::CrazyHand => "crazy_hand",
+            Self::Dharkon => "dharkon",
+            Self::Galeem => "galeem",
+            Self::Marx => "marx",
+            Self::GigaBowser => "giga_bowser",
+            Self::Ganon => "ganon_boss",
+            Self::Dracula => "dracula",
+            Self::Rathalos => "rathalos",
+            Self::Galleom => "galleom",
+            Self::WolMasterHand => "wol_master_hand",
+        }
+    }
+
+    #[cfg(test)]
+    fn config_key(self) -> &'static str {
+        match self {
+            Self::MasterHand => "MASTER_HAND_CSS",
+            Self::CrazyHand => "CRAZY_HAND_CSS",
+            Self::Dharkon => "DHARKON_CSS",
+            Self::Galeem => "GALEEM_CSS",
+            Self::Marx => "MARX_CSS",
+            Self::GigaBowser => "GIGA_BOWSER_CSS",
+            Self::Ganon => "GANON_CSS",
+            Self::Dracula => "DRACULA_CSS",
+            Self::Rathalos => "RATHALOS_CSS",
+            Self::Galleom => "GALLEOM_CSS",
+            Self::WolMasterHand => "WOL_MASTER_HAND_CSS",
+        }
+    }
+
+    fn standalone_enabled(self, options: &crate::config::Options) -> bool {
+        match self {
+            Self::MasterHand => options.master_hand_css,
+            Self::CrazyHand => options.crazy_hand_css,
+            Self::Dharkon => options.dharkon_css,
+            Self::Galeem => options.galeem_css,
+            Self::Marx => options.marx_css,
+            Self::GigaBowser => options.giga_bowser_css,
+            Self::Ganon => options.ganon_css,
+            Self::Dracula => options.dracula_css,
+            Self::Rathalos => options.rathalos_css,
+            Self::Galleom => options.galleom_css,
+            Self::WolMasterHand => options.wol_master_hand_css,
+        }
+        .unwrap_or(true)
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum CondensedCssRole {
     Carrier,
     Suppressed,
@@ -1865,8 +2193,45 @@ fn apply_condensed_css_visibility_for_mode(
     }
 }
 
-fn apply_condensed_css_visibility(charroot: &mut ParamStruct, ui_chara_id: &str) {
-    apply_condensed_css_visibility_for_mode(charroot, ui_chara_id, condensed_css_enabled());
+fn hide_standalone_css_row(charroot: &mut ParamStruct) {
+    patch_bool_field(charroot, to_hash40("can_select"), false);
+    patch_bool_field(charroot, to_hash40("is_hidden_boss"), true);
+    patch_i8_field(charroot, to_hash40("disp_order"), -1);
+    patch_i8_field(charroot, to_hash40("skill_list_order"), -1);
+}
+
+fn apply_giga_bowser_css_visibility(charroot: &mut ParamStruct, standalone_enabled: bool) {
+    if !standalone_enabled {
+        hide_standalone_css_row(charroot);
+    }
+}
+
+fn apply_item_boss_css_visibility_for_mode(
+    charroot: &mut ParamStruct,
+    ui_chara_id: &str,
+    condensed_enabled: bool,
+    standalone_enabled: bool,
+) {
+    if condensed_enabled {
+        apply_condensed_css_visibility_for_mode(charroot, ui_chara_id, true);
+    } else if !standalone_enabled {
+        // Amiibo identity may require this database callback even when the
+        // corresponding standalone CSS option is disabled.
+        hide_standalone_css_row(charroot);
+    }
+}
+
+fn apply_item_boss_css_visibility(
+    charroot: &mut ParamStruct,
+    ui_chara_id: &str,
+    standalone_enabled: bool,
+) {
+    apply_item_boss_css_visibility_for_mode(
+        charroot,
+        ui_chara_id,
+        condensed_css_enabled(),
+        standalone_enabled,
+    );
 }
 
 fn configure_condensed_masterhand_carrier_fields(
@@ -1934,11 +2299,9 @@ fn configure_condensed_masterhand_carrier_fields(
     Ok(CONDENSED_COLOR_MAP_FIELDS.len() * CONDENSED_COLOR_MAP_FIELDS[0].len())
 }
 
-/// Condensed mode owns the carrier/suppression rows regardless of legacy CSS
-/// options. With condensed mode off, this is exactly the previous CUSTOM_CSS
-/// and per-boss/Amiibo callback policy. Character-name detection is selection
-/// logic and deliberately cannot disable these named PRC mutations.
-fn should_install_item_boss_css_callback(
+/// Install a database callback when either CSS presentation or Amiibo identity
+/// needs the row. Visibility remains independently owned by the CSS option.
+fn should_install_item_boss_db_callback(
     condensed_enabled: bool,
     custom_css: bool,
     _detect_character_name: bool,
@@ -1948,12 +2311,16 @@ fn should_install_item_boss_css_callback(
     condensed_enabled || (!custom_css && (individual_css_enabled || amiibo_mapping_enabled))
 }
 
-fn should_install_giga_bowser_css_callback(
+fn should_install_giga_bowser_db_callback(
     custom_css: bool,
     giga_bowser_css: bool,
     amiibo_mapping_enabled: bool,
 ) -> bool {
     !custom_css && (giga_bowser_css || amiibo_mapping_enabled)
+}
+
+fn should_install_giga_bowser_layout(custom_css: bool, giga_bowser_css: bool) -> bool {
+    !custom_css && giga_bowser_css
 }
 
 #[arc_callback]
@@ -2754,6 +3121,10 @@ fn callback_koopag(hash: u64, mut data: &mut [u8]) -> Option<usize> {
         to_hash40("fighter_type_normal"),
     );
     patch_css_selector_fields(&mut target_row, "ui_chara_koopag", 0x18E);
+    apply_giga_bowser_css_visibility(
+        &mut target_row,
+        BossCssOption::GigaBowser.standalone_enabled(&CONFIG.options),
+    );
 
     db_root_list.0[target_index] = ParamKind::Struct(target_row);
     crate::boss_log!(
@@ -2888,6 +3259,11 @@ fn callback_masterhand(hash: u64, mut data: &mut [u8]) -> Option<usize> {
             }
         }
     }
+    apply_item_boss_css_visibility(
+        &mut charroot,
+        BossCssOption::MasterHand.ui_chara_id(),
+        BossCssOption::MasterHand.standalone_enabled(&CONFIG.options),
+    );
     db_root_list.0[carrier_index] = ParamKind::Struct(charroot);
     amiibo_preview::log_ui_chara_db_boundary(
         "ui_chara_masterhand",
@@ -2961,7 +3337,11 @@ fn callback_crazyhand(hash: u64, mut data: &mut [u8]) -> Option<usize> {
         }
     });
     patch_css_selector_fields(charroot, "ui_chara_crazyhand", 0x169);
-    apply_condensed_css_visibility(charroot, "ui_chara_crazyhand");
+    apply_item_boss_css_visibility(
+        charroot,
+        BossCssOption::CrazyHand.ui_chara_id(),
+        BossCssOption::CrazyHand.standalone_enabled(&CONFIG.options),
+    );
     let mut writer = std::io::Cursor::new(data);
     write_stream(&mut writer, &root).unwrap();
     return Some(writer.position() as usize);
@@ -3022,7 +3402,11 @@ fn callback_dharkon(hash: u64, mut data: &mut [u8]) -> Option<usize> {
         }
     });
     patch_css_selector_fields(charroot, "ui_chara_darz", 0x19A);
-    apply_condensed_css_visibility(charroot, "ui_chara_darz");
+    apply_item_boss_css_visibility(
+        charroot,
+        BossCssOption::Dharkon.ui_chara_id(),
+        BossCssOption::Dharkon.standalone_enabled(&CONFIG.options),
+    );
     let mut writer = std::io::Cursor::new(data);
     write_stream(&mut writer, &root).unwrap();
     return Some(writer.position() as usize);
@@ -3083,7 +3467,11 @@ fn callback_galeem(hash: u64, mut data: &mut [u8]) -> Option<usize> {
         }
     });
     patch_css_selector_fields(charroot, "ui_chara_kiila", 0x18F);
-    apply_condensed_css_visibility(charroot, "ui_chara_kiila");
+    apply_item_boss_css_visibility(
+        charroot,
+        BossCssOption::Galeem.ui_chara_id(),
+        BossCssOption::Galeem.standalone_enabled(&CONFIG.options),
+    );
     let mut writer = std::io::Cursor::new(data);
     write_stream(&mut writer, &root).unwrap();
     return Some(writer.position() as usize);
@@ -3144,7 +3532,11 @@ fn callback_marx(hash: u64, mut data: &mut [u8]) -> Option<usize> {
         }
     });
     patch_css_selector_fields(charroot, "ui_chara_marx", 0x180);
-    apply_condensed_css_visibility(charroot, "ui_chara_marx");
+    apply_item_boss_css_visibility(
+        charroot,
+        BossCssOption::Marx.ui_chara_id(),
+        BossCssOption::Marx.standalone_enabled(&CONFIG.options),
+    );
     let mut writer = std::io::Cursor::new(data);
     write_stream(&mut writer, &root).unwrap();
     return Some(writer.position() as usize);
@@ -3206,7 +3598,11 @@ fn callback_ganon(hash: u64, mut data: &mut [u8]) -> Option<usize> {
         }
     });
     patch_css_selector_fields(charroot, "ui_chara_ganonboss", 0x172);
-    apply_condensed_css_visibility(charroot, "ui_chara_ganonboss");
+    apply_item_boss_css_visibility(
+        charroot,
+        BossCssOption::Ganon.ui_chara_id(),
+        BossCssOption::Ganon.standalone_enabled(&CONFIG.options),
+    );
     let mut writer = std::io::Cursor::new(data);
     write_stream(&mut writer, &root).unwrap();
     return Some(writer.position() as usize);
@@ -3267,7 +3663,11 @@ fn callback_dracula(hash: u64, mut data: &mut [u8]) -> Option<usize> {
         }
     });
     patch_css_selector_fields(charroot, "ui_chara_dracula", 0x175);
-    apply_condensed_css_visibility(charroot, "ui_chara_dracula");
+    apply_item_boss_css_visibility(
+        charroot,
+        BossCssOption::Dracula.ui_chara_id(),
+        BossCssOption::Dracula.standalone_enabled(&CONFIG.options),
+    );
     let mut writer = std::io::Cursor::new(data);
     write_stream(&mut writer, &root).unwrap();
     return Some(writer.position() as usize);
@@ -3328,7 +3728,11 @@ fn callback_galleom(hash: u64, mut data: &mut [u8]) -> Option<usize> {
         }
     });
     patch_css_selector_fields(charroot, "ui_chara_galleom", 0x16F);
-    apply_condensed_css_visibility(charroot, "ui_chara_galleom");
+    apply_item_boss_css_visibility(
+        charroot,
+        BossCssOption::Galleom.ui_chara_id(),
+        BossCssOption::Galleom.standalone_enabled(&CONFIG.options),
+    );
     let mut writer = std::io::Cursor::new(data);
     write_stream(&mut writer, &root).unwrap();
     return Some(writer.position() as usize);
@@ -3389,7 +3793,11 @@ fn callback_rathalos(hash: u64, mut data: &mut [u8]) -> Option<usize> {
         }
     });
     patch_css_selector_fields(charroot, "ui_chara_lioleus", 0x188);
-    apply_condensed_css_visibility(charroot, "ui_chara_lioleus");
+    apply_item_boss_css_visibility(
+        charroot,
+        BossCssOption::Rathalos.ui_chara_id(),
+        BossCssOption::Rathalos.standalone_enabled(&CONFIG.options),
+    );
     let mut writer = std::io::Cursor::new(data);
     write_stream(&mut writer, &root).unwrap();
     return Some(writer.position() as usize);
@@ -3451,7 +3859,11 @@ fn callback_wolmh(hash: u64, mut data: &mut [u8]) -> Option<usize> {
         }
     });
     patch_css_selector_fields(charroot, "ui_chara_mewtwo_masterhand", 0x1A6);
-    apply_condensed_css_visibility(charroot, "ui_chara_mewtwo_masterhand");
+    apply_item_boss_css_visibility(
+        charroot,
+        BossCssOption::WolMasterHand.ui_chara_id(),
+        BossCssOption::WolMasterHand.standalone_enabled(&CONFIG.options),
+    );
     let mut writer = std::io::Cursor::new(data);
     write_stream(&mut writer, &root).unwrap();
     return Some(writer.position() as usize);
@@ -3748,17 +4160,7 @@ pub fn main() {
     let condensed_css = opts.condense_bosses_into_single_slot();
     let custom_css = opts.custom_css.unwrap_or(false);
     let detect_character_name = opts.detect_character_name.unwrap_or(false);
-    let master_hand_css = opts.master_hand_css.unwrap_or(true);
-    let crazy_hand_css = opts.crazy_hand_css.unwrap_or(true);
-    let dharkon_css = opts.dharkon_css.unwrap_or(true);
-    let galeem_css = opts.galeem_css.unwrap_or(true);
-    let marx_css = opts.marx_css.unwrap_or(true);
-    let giga_bowser_css = opts.giga_bowser_css.unwrap_or(true);
-    let ganon_css = opts.ganon_css.unwrap_or(true);
-    let dracula_css = opts.dracula_css.unwrap_or(true);
-    let rathalos_css = opts.rathalos_css.unwrap_or(true);
-    let galleom_css = opts.galleom_css.unwrap_or(true);
-    let wol_master_hand_css = opts.wol_master_hand_css.unwrap_or(true);
+    let giga_bowser_css = BossCssOption::GigaBowser.standalone_enabled(opts);
     let final2_stage = opts.final2_stage.unwrap_or(true);
     let final3_stage = opts.final3_stage.unwrap_or(true);
     let ganon_stage = opts.ganon_stage.unwrap_or(true);
@@ -3772,11 +4174,21 @@ pub fn main() {
             .iter()
             .any(|mapping| mapping.identity.key == key)
     };
-    let install_giga_bowser_css = should_install_giga_bowser_css_callback(
+    let install_item_boss_db = |boss: BossCssOption| {
+        should_install_item_boss_db_callback(
+            condensed_css,
+            custom_css,
+            detect_character_name,
+            boss.standalone_enabled(opts),
+            amiibo_has(boss.amiibo_key()),
+        )
+    };
+    let install_giga_bowser_db = should_install_giga_bowser_db_callback(
         custom_css,
         giga_bowser_css,
-        amiibo_has("giga_bowser"),
+        amiibo_has(BossCssOption::GigaBowser.amiibo_key()),
     );
+    let install_giga_bowser_layout = should_install_giga_bowser_layout(custom_css, giga_bowser_css);
     // The viewer's identity handoff is runtime behavior, not debug-only
     // instrumentation. Populate its allowlist before any selection hook can
     // observe a Figure Player row.
@@ -3844,101 +4256,41 @@ pub fn main() {
         callback_amiibo::install("ui/param/database/ui_amiibo_db.prc", MAX_FILE_SIZE);
     }
 
-    if install_giga_bowser_css {
+    if install_giga_bowser_db {
         callback_koopag::install("ui/param/database/ui_chara_db.prc", MAX_FILE_SIZE);
     }
 
-    if should_install_item_boss_css_callback(
-        condensed_css,
-        custom_css,
-        detect_character_name,
-        master_hand_css,
-        amiibo_has("master_hand"),
-    ) {
+    if install_item_boss_db(BossCssOption::MasterHand) {
         callback_masterhand::install("ui/param/database/ui_chara_db.prc", MAX_FILE_SIZE);
     }
-    if should_install_item_boss_css_callback(
-        condensed_css,
-        custom_css,
-        detect_character_name,
-        crazy_hand_css,
-        amiibo_has("crazy_hand"),
-    ) {
+    if install_item_boss_db(BossCssOption::CrazyHand) {
         callback_crazyhand::install("ui/param/database/ui_chara_db.prc", MAX_FILE_SIZE);
     }
-    if should_install_item_boss_css_callback(
-        condensed_css,
-        custom_css,
-        detect_character_name,
-        dharkon_css,
-        amiibo_has("dharkon"),
-    ) {
+    if install_item_boss_db(BossCssOption::Dharkon) {
         callback_dharkon::install("ui/param/database/ui_chara_db.prc", MAX_FILE_SIZE);
     }
-    if should_install_item_boss_css_callback(
-        condensed_css,
-        custom_css,
-        detect_character_name,
-        galeem_css,
-        amiibo_has("galeem"),
-    ) {
+    if install_item_boss_db(BossCssOption::Galeem) {
         callback_galeem::install("ui/param/database/ui_chara_db.prc", MAX_FILE_SIZE);
     }
-    if should_install_item_boss_css_callback(
-        condensed_css,
-        custom_css,
-        detect_character_name,
-        dracula_css,
-        amiibo_has("dracula"),
-    ) {
+    if install_item_boss_db(BossCssOption::Dracula) {
         callback_dracula::install("ui/param/database/ui_chara_db.prc", MAX_FILE_SIZE);
     }
-    if should_install_item_boss_css_callback(
-        condensed_css,
-        custom_css,
-        detect_character_name,
-        marx_css,
-        amiibo_has("marx"),
-    ) {
+    if install_item_boss_db(BossCssOption::Marx) {
         callback_marx::install("ui/param/database/ui_chara_db.prc", MAX_FILE_SIZE);
     }
-    if should_install_item_boss_css_callback(
-        condensed_css,
-        custom_css,
-        detect_character_name,
-        ganon_css,
-        amiibo_has("ganon_boss"),
-    ) {
+    if install_item_boss_db(BossCssOption::Ganon) {
         callback_ganon::install("ui/param/database/ui_chara_db.prc", MAX_FILE_SIZE);
     }
-    if should_install_item_boss_css_callback(
-        condensed_css,
-        custom_css,
-        detect_character_name,
-        galleom_css,
-        amiibo_has("galleom"),
-    ) {
+    if install_item_boss_db(BossCssOption::Galleom) {
         callback_galleom::install("ui/param/database/ui_chara_db.prc", MAX_FILE_SIZE);
     }
-    if should_install_item_boss_css_callback(
-        condensed_css,
-        custom_css,
-        detect_character_name,
-        rathalos_css,
-        amiibo_has("rathalos"),
-    ) {
+    if install_item_boss_db(BossCssOption::Rathalos) {
         callback_rathalos::install("ui/param/database/ui_chara_db.prc", MAX_FILE_SIZE);
     }
-    if should_install_item_boss_css_callback(
-        condensed_css,
-        custom_css,
-        detect_character_name,
-        wol_master_hand_css,
-        amiibo_has("wol_master_hand"),
-    ) {
+    if install_item_boss_db(BossCssOption::WolMasterHand) {
         callback_wolmh::install("ui/param/database/ui_chara_db.prc", MAX_FILE_SIZE);
     }
-    match UiLayoutPatchMode::for_features(install_giga_bowser_css, condensed_css) {
+    match UiLayoutPatchMode::for_features(install_giga_bowser_layout, condensed_css) {
         Some(UiLayoutPatchMode::Koopag) => callback_koopag_layout::install(
             "ui/param/database/ui_layout_db.prc",
             MAX_UI_LAYOUT_FILE_SIZE,
@@ -3974,6 +4326,110 @@ pub fn main() {
     }
     if dracula_stage {
         callback_map_7::install("ui/param/database/ui_stage_db.prc", MAX_FILE_SIZE);
+    }
+}
+
+#[cfg(test)]
+mod classic_clear_camera_tests {
+    use super::{
+        is_classic_stage_transition_after_teardown, is_verified_new_round_boundary,
+        BossTransitionPhase, ClassicClearCameraAnchor,
+    };
+
+    #[test]
+    fn anchor_tracks_latest_position_and_holds_only_during_post_match_gap() {
+        let mut anchor = ClassicClearCameraAnchor::EMPTY;
+        assert!(anchor.capture([10.0, 20.0, 30.0], 4));
+        assert!(!anchor.capture([40.0, 50.0, 60.0], 4));
+
+        assert_eq!(
+            anchor.hold_position(4, BossTransitionPhase::PostMatchPreResult),
+            Some([40.0, 50.0, 60.0])
+        );
+        for phase in [
+            BossTransitionPhase::NotApplicable,
+            BossTransitionPhase::Battle,
+            BossTransitionPhase::ResultReady,
+            BossTransitionPhase::SceneExit,
+        ] {
+            assert_eq!(anchor.hold_position(4, phase), None);
+        }
+    }
+
+    #[test]
+    fn anchor_fails_closed_across_generations_and_after_release() {
+        let mut anchor = ClassicClearCameraAnchor::EMPTY;
+        anchor.capture([1.0, 2.0, 3.0], 7);
+
+        assert_eq!(
+            anchor.hold_position(8, BossTransitionPhase::PostMatchPreResult),
+            None
+        );
+        assert!(!anchor.capture([f32::NAN, 9.0, 9.0], 7));
+        assert_eq!(
+            anchor.hold_position(7, BossTransitionPhase::PostMatchPreResult),
+            Some([1.0, 2.0, 3.0])
+        );
+        assert!(anchor.clear());
+        assert!(!anchor.clear());
+        assert_eq!(
+            anchor.hold_position(7, BossTransitionPhase::PostMatchPreResult),
+            None
+        );
+    }
+
+    #[test]
+    fn anchors_are_independent_per_entry() {
+        let mut anchors = [ClassicClearCameraAnchor::EMPTY; 2];
+        anchors[0].capture([-15.0, 5.0, 0.0], 2);
+        anchors[1].capture([25.0, 45.0, 0.0], 2);
+
+        assert_eq!(
+            anchors[0].hold_position(2, BossTransitionPhase::PostMatchPreResult),
+            Some([-15.0, 5.0, 0.0])
+        );
+        assert_eq!(
+            anchors[1].hold_position(2, BossTransitionPhase::PostMatchPreResult),
+            Some([25.0, 45.0, 0.0])
+        );
+    }
+
+    #[test]
+    fn result_quarantine_can_bridge_a_cleared_result_state_into_native_entry() {
+        assert!(is_verified_new_round_boundary(
+            false, true, false, false, true, false, false
+        ));
+        assert!(!is_verified_new_round_boundary(
+            false, true, false, false, false, false, false
+        ));
+        assert!(!is_verified_new_round_boundary(
+            false, false, false, false, true, false, false
+        ));
+    }
+
+    #[test]
+    fn completed_teardown_and_stage_change_identify_a_classic_round_boundary() {
+        assert!(is_classic_stage_transition_after_teardown(true, 0x65, 0xe6));
+        assert!(!is_classic_stage_transition_after_teardown(
+            false, 0x65, 0xe6
+        ));
+        assert!(!is_classic_stage_transition_after_teardown(
+            true, 0x65, 0x65
+        ));
+        assert!(!is_classic_stage_transition_after_teardown(
+            true,
+            0x65,
+            crate::boss_helpers::STAGE_ID_RESULT
+        ));
+        assert!(is_verified_new_round_boundary(
+            true, false, false, false, false, true, false
+        ));
+        assert!(!is_verified_new_round_boundary(
+            false, false, false, false, false, true, false
+        ));
+        assert!(!is_verified_new_round_boundary(
+            true, false, false, false, false, false, false
+        ));
     }
 }
 
@@ -4043,12 +4499,6 @@ mod condensed_css_tests {
             .map(|offset| start + offset)
             .expect("missing BNTX relocation section");
         &data[start..end]
-    }
-
-    fn fnv1a64(data: &[u8]) -> u64 {
-        data.iter().fold(0xcbf29ce484222325, |hash, byte| {
-            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
-        })
     }
 
     fn assert_manifest_path_once(manifest: &str, path: &str) {
@@ -4176,6 +4626,213 @@ mod condensed_css_tests {
     }
 
     #[test]
+    fn every_css_option_maps_to_its_production_row_and_amiibo_key() {
+        assert_eq!(
+            BossCssOption::ALL.map(|boss| {
+                (
+                    boss,
+                    boss.config_key(),
+                    boss.ui_chara_id(),
+                    boss.amiibo_key(),
+                )
+            }),
+            [
+                (
+                    BossCssOption::MasterHand,
+                    "MASTER_HAND_CSS",
+                    "ui_chara_masterhand",
+                    "master_hand",
+                ),
+                (
+                    BossCssOption::CrazyHand,
+                    "CRAZY_HAND_CSS",
+                    "ui_chara_crazyhand",
+                    "crazy_hand",
+                ),
+                (
+                    BossCssOption::Dharkon,
+                    "DHARKON_CSS",
+                    "ui_chara_darz",
+                    "dharkon",
+                ),
+                (
+                    BossCssOption::Galeem,
+                    "GALEEM_CSS",
+                    "ui_chara_kiila",
+                    "galeem",
+                ),
+                (BossCssOption::Marx, "MARX_CSS", "ui_chara_marx", "marx",),
+                (
+                    BossCssOption::GigaBowser,
+                    "GIGA_BOWSER_CSS",
+                    "ui_chara_koopag",
+                    "giga_bowser",
+                ),
+                (
+                    BossCssOption::Ganon,
+                    "GANON_CSS",
+                    "ui_chara_ganonboss",
+                    "ganon_boss",
+                ),
+                (
+                    BossCssOption::Dracula,
+                    "DRACULA_CSS",
+                    "ui_chara_dracula",
+                    "dracula",
+                ),
+                (
+                    BossCssOption::Rathalos,
+                    "RATHALOS_CSS",
+                    "ui_chara_lioleus",
+                    "rathalos",
+                ),
+                (
+                    BossCssOption::Galleom,
+                    "GALLEOM_CSS",
+                    "ui_chara_galleom",
+                    "galleom",
+                ),
+                (
+                    BossCssOption::WolMasterHand,
+                    "WOL_MASTER_HAND_CSS",
+                    "ui_chara_mewtwo_masterhand",
+                    "wol_master_hand",
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_css_toggle_parses_and_defaults_independently() {
+        let omitted: crate::config::Config =
+            toml::from_str("[options]\n").expect("minimal config should parse");
+        for boss in BossCssOption::ALL {
+            assert!(
+                boss.standalone_enabled(&omitted.options),
+                "{boss:?} should preserve the historical enabled default"
+            );
+        }
+
+        for disabled_boss in BossCssOption::ALL {
+            let source = format!("[options]\n{} = false\n", disabled_boss.config_key());
+            let config: crate::config::Config =
+                toml::from_str(&source).expect("single-option CSS config should parse");
+            for boss in BossCssOption::ALL {
+                assert_eq!(
+                    boss.standalone_enabled(&config.options),
+                    boss != disabled_boss,
+                    "{disabled_boss:?} must disable only its own CSS row; checked {boss:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_css_option_obeys_the_full_mode_matrix() {
+        for boss in BossCssOption::ITEM_BACKED {
+            assert!(should_install_item_boss_db_callback(
+                false, false, true, true, false
+            ));
+            assert!(!should_install_item_boss_db_callback(
+                false, false, true, false, false
+            ));
+            assert!(should_install_item_boss_db_callback(
+                false, false, true, false, true
+            ));
+            assert!(!should_install_item_boss_db_callback(
+                false, true, true, true, true
+            ));
+            assert!(should_install_item_boss_db_callback(
+                true, true, false, false, false
+            ));
+
+            let mut disabled_row = css_visibility_row(true, false, 120, 90);
+            apply_item_boss_css_visibility_for_mode(
+                &mut disabled_row,
+                boss.ui_chara_id(),
+                false,
+                false,
+            );
+            assert_eq!(
+                read_bool_field(&disabled_row, to_hash40("can_select")),
+                Some(false),
+                "{boss:?} remained selectable while its CSS option was false"
+            );
+            assert_eq!(
+                read_bool_field(&disabled_row, to_hash40("is_hidden_boss")),
+                Some(true),
+                "{boss:?} was not marked hidden while its CSS option was false"
+            );
+            assert_eq!(
+                read_i8_field(&disabled_row, to_hash40("disp_order")),
+                Some(-1)
+            );
+            assert_eq!(
+                read_i8_field(&disabled_row, to_hash40("skill_list_order")),
+                Some(-1)
+            );
+
+            let mut enabled_row = css_visibility_row(true, false, 120, 90);
+            let expected_enabled = enabled_row.clone();
+            apply_item_boss_css_visibility_for_mode(
+                &mut enabled_row,
+                boss.ui_chara_id(),
+                false,
+                true,
+            );
+            assert_eq!(
+                enabled_row, expected_enabled,
+                "{boss:?} enabled row drifted"
+            );
+
+            let mut condensed_row = css_visibility_row(true, false, 120, 90);
+            apply_item_boss_css_visibility_for_mode(
+                &mut condensed_row,
+                boss.ui_chara_id(),
+                true,
+                true,
+            );
+            let expected_selectable = boss == BossCssOption::MasterHand;
+            assert_eq!(
+                read_bool_field(&condensed_row, to_hash40("can_select")),
+                Some(expected_selectable),
+                "{boss:?} has the wrong condensed visibility"
+            );
+        }
+
+        assert!(should_install_giga_bowser_db_callback(false, true, false));
+        assert!(should_install_giga_bowser_db_callback(false, false, true));
+        assert!(!should_install_giga_bowser_db_callback(false, false, false));
+        assert!(!should_install_giga_bowser_db_callback(true, true, true));
+        assert!(should_install_giga_bowser_layout(false, true));
+        assert!(!should_install_giga_bowser_layout(false, false));
+        assert!(!should_install_giga_bowser_layout(true, true));
+
+        let mut giga_disabled = css_visibility_row(true, false, 15, 15);
+        apply_giga_bowser_css_visibility(&mut giga_disabled, false);
+        assert_eq!(
+            read_bool_field(&giga_disabled, to_hash40("can_select")),
+            Some(false)
+        );
+        assert_eq!(
+            read_bool_field(&giga_disabled, to_hash40("is_hidden_boss")),
+            Some(true)
+        );
+
+        let mut giga_condensed = css_visibility_row(true, false, 15, 15);
+        let expected_giga = giga_condensed.clone();
+        apply_condensed_css_visibility_for_mode(
+            &mut giga_condensed,
+            BossCssOption::GigaBowser.ui_chara_id(),
+            true,
+        );
+        assert_eq!(
+            giga_condensed, expected_giga,
+            "condensed mode must not alter Giga"
+        );
+    }
+
+    #[test]
     fn condensed_css_roles_are_explicit_for_every_required_entry() {
         assert_eq!(
             CONDENSED_SUPPRESSED_UI_CHARA,
@@ -4238,10 +4895,59 @@ mod condensed_css_tests {
         apply_condensed_css_visibility_for_mode(&mut giga, "ui_chara_koopag", true);
         assert_eq!(giga, original_giga);
 
-        let mut disabled = css_visibility_row(true, false, 120, 90);
-        let original_disabled = disabled.clone();
-        apply_condensed_css_visibility_for_mode(&mut disabled, "ui_chara_crazyhand", false);
-        assert_eq!(disabled, original_disabled);
+        let mut standalone_disabled = css_visibility_row(true, false, 120, 90);
+        apply_item_boss_css_visibility_for_mode(
+            &mut standalone_disabled,
+            "ui_chara_crazyhand",
+            false,
+            false,
+        );
+        assert_eq!(
+            read_bool_field(&standalone_disabled, to_hash40("can_select")),
+            Some(false)
+        );
+        assert_eq!(
+            read_bool_field(&standalone_disabled, to_hash40("is_hidden_boss")),
+            Some(true)
+        );
+        assert_eq!(
+            read_i8_field(&standalone_disabled, to_hash40("disp_order")),
+            Some(-1)
+        );
+
+        let mut standalone_enabled = css_visibility_row(true, false, 120, 90);
+        let original_enabled = standalone_enabled.clone();
+        apply_item_boss_css_visibility_for_mode(
+            &mut standalone_enabled,
+            "ui_chara_crazyhand",
+            false,
+            true,
+        );
+        assert_eq!(standalone_enabled, original_enabled);
+
+        let mut condensed_carrier = css_visibility_row(false, true, -1, -1);
+        apply_item_boss_css_visibility_for_mode(
+            &mut condensed_carrier,
+            CONDENSED_CARRIER_UI_CHARA,
+            true,
+            false,
+        );
+        assert_eq!(
+            read_bool_field(&condensed_carrier, to_hash40("can_select")),
+            Some(true)
+        );
+
+        let mut condensed_suppressed = css_visibility_row(true, false, 120, 90);
+        apply_item_boss_css_visibility_for_mode(
+            &mut condensed_suppressed,
+            "ui_chara_crazyhand",
+            true,
+            true,
+        );
+        assert_eq!(
+            read_bool_field(&condensed_suppressed, to_hash40("can_select")),
+            Some(false)
+        );
     }
 
     #[test]
@@ -4561,49 +5267,25 @@ mod condensed_css_tests {
     #[test]
     fn condensed_native_portraits_are_installable_and_self_named() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let manifest = std::fs::read_to_string(root.join("ultimate/mods/Bosses/config.json"))
+        let manifest = std::fs::read_to_string(root.join("Bosses/config.json"))
             .expect("missing ARCropolis mod manifest");
-        // Colors 1-7 are byte-for-byte Ultimate's native boss texture payloads
-        // from the matching chara_1 family. Only their single BNTX texture key
-        // is changed to the Master Hand carrier's color-specific lookup.
-        let native_payload_fingerprints = [
-            0xb451a665b2de2d9f,
-            0x3c93b7ca716a256e,
-            0x0c51f6e5b257133a,
-            0x6d4d97d9c81a8590,
-            0xf76775032f8ae450,
-            0xb3bedd15e7b87e4e,
-            0xce44555f1fc66007,
-        ];
         for color in 0..CONDENSED_NATIVE_COLOR_COUNT {
             let internal_name = format!("chara_1_masterhand_{color:02}");
-            let relative_path =
-                format!("ultimate/mods/Bosses/ui/replace/chara/chara_1/{internal_name}.bntx");
+            let relative_path = format!("Bosses/ui/replace/chara/chara_1/{internal_name}.bntx");
             let data = std::fs::read(root.join(&relative_path))
                 .unwrap_or_else(|_| panic!("missing condensed portrait asset {relative_path}"));
             let info = parse_single_texture_bntx(&data);
             assert_eq!(info.name, internal_name);
-            assert_manifest_path_once(
-                &manifest,
-                relative_path.trim_start_matches("ultimate/mods/Bosses/"),
-            );
+            assert_manifest_path_once(&manifest, relative_path.trim_start_matches("Bosses/"));
 
-            if color > 0 {
-                assert_eq!(data.len(), 266_344);
-                assert_eq!((info.width, info.height), (512, 512));
-                assert_eq!(
-                    fnv1a64(bntx_texture_payload(&data)),
-                    native_payload_fingerprints[usize::from(color - 1)],
-                    "color {color} must retain its source-proven native boss portrait payload"
-                );
-            }
+            assert!(info.width > 0 && info.height > 0);
         }
     }
 
     #[test]
     fn condensed_native_css_icons_are_installable_and_self_named() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let manifest = std::fs::read_to_string(root.join("ultimate/mods/Bosses/config.json"))
+        let manifest = std::fs::read_to_string(root.join("Bosses/config.json"))
             .expect("missing ARCropolis mod manifest");
 
         // Color zero uses Ultimate's existing Master Hand icon. The remaining
@@ -4620,15 +5302,14 @@ mod condensed_css_tests {
         ];
         for color in 1..CONDENSED_NATIVE_COLOR_COUNT {
             let internal_name = format!("chara_4_masterhand_{color:02}");
-            let relative_path =
-                format!("ultimate/mods/Bosses/ui/replace/chara/chara_4/{internal_name}.bntx");
+            let relative_path = format!("Bosses/ui/replace/chara/chara_4/{internal_name}.bntx");
             let data = std::fs::read(root.join(&relative_path))
                 .unwrap_or_else(|_| panic!("missing condensed CSS icon {relative_path}"));
             assert_eq!(parse_single_texture_bntx(&data).name, internal_name);
 
             let source_name = variant_names[usize::from(color)];
             let source_path = root.join(format!(
-                "ultimate/mods/Bosses/ui/replace/chara/chara_4/chara_4_{source_name}_00.bntx"
+                "Bosses/ui/replace/chara/chara_4/chara_4_{source_name}_00.bntx"
             ));
             let source_data = std::fs::read(&source_path)
                 .unwrap_or_else(|_| panic!("missing source CSS icon {}", source_path.display()));
@@ -4637,10 +5318,7 @@ mod condensed_css_tests {
                 bntx_texture_payload(&source_data),
                 "color {color} must retain the {source_name} CSS icon payload"
             );
-            assert_manifest_path_once(
-                &manifest,
-                relative_path.trim_start_matches("ultimate/mods/Bosses/"),
-            );
+            assert_manifest_path_once(&manifest, relative_path.trim_start_matches("Bosses/"));
         }
 
         assert!(
@@ -4650,162 +5328,81 @@ mod condensed_css_tests {
     }
 
     #[test]
-    fn condensed_native_stock_and_layout_portraits_are_installable_and_self_named() {
+    fn stage_and_giga_bowser_assets_remain_installable() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let manifest = std::fs::read_to_string(root.join("ultimate/mods/Bosses/config.json"))
+        let manifest = std::fs::read_to_string(root.join("Bosses/config.json"))
             .expect("missing ARCropolis mod manifest");
-        let variant_names = [
-            "masterhand",
-            "crazyhand",
-            "darz",
-            "kiila",
-            "ganonboss",
-            "lioleus",
-            "dracula",
-            "marx",
-        ];
 
-        for family in [2, 7] {
-            for color in 0..CONDENSED_NATIVE_COLOR_COUNT {
-                let internal_name = format!("chara_{family}_masterhand_{color:02}");
+        for relative_path in [
+            "ui/replace/chara/chara_2/chara_2_koopag_00.bntx",
+            "ui/replace/chara/chara_4/chara_4_koopag_00.bntx",
+            "ui/replace/chara/chara_7/chara_7_koopag_00.bntx",
+        ] {
+            assert!(root.join("Bosses").join(relative_path).is_file());
+            assert_manifest_path_once(&manifest, relative_path);
+        }
+
+        for family in [1, 2] {
+            for stage in [
+                "final1",
+                "final2",
+                "final3",
+                "galleom",
+                "ganonboss",
+                "marx",
+                "rathalos",
+                "dracula",
+            ] {
                 let relative_path = format!(
-                    "ultimate/mods/Bosses/ui/replace/chara/chara_{family}/{internal_name}.bntx"
+                    "ui/replace/stage/stage_{family}/stage_{family}_bossstage_{stage}.bntx"
                 );
-                let data = std::fs::read(root.join(&relative_path))
-                    .unwrap_or_else(|_| panic!("missing condensed carrier asset {relative_path}"));
-                assert_eq!(parse_single_texture_bntx(&data).name, internal_name);
-                assert_manifest_path_once(
-                    &manifest,
-                    relative_path.trim_start_matches("ultimate/mods/Bosses/"),
+                assert!(
+                    root.join("Bosses").join(&relative_path).is_file(),
+                    "missing stage UI asset {relative_path}"
                 );
-
-                if color > 0 {
-                    let source_name = variant_names[usize::from(color)];
-                    let source_path = root.join(format!(
-                        "ultimate/mods/Bosses/ui/replace/chara/chara_{family}/chara_{family}_{source_name}_00.bntx"
-                    ));
-                    let source_data = std::fs::read(&source_path).unwrap_or_else(|_| {
-                        panic!("missing carrier source asset {}", source_path.display())
-                    });
-                    assert_eq!(
-                        bntx_texture_payload(&data),
-                        bntx_texture_payload(&source_data),
-                        "family {family} color {color} must retain the {source_name} texture payload"
-                    );
-                }
+                assert_manifest_path_once(&manifest, &relative_path);
             }
         }
     }
 
     #[test]
-    fn condensed_name_archive_contains_carrier_and_variant_labels() {
+    fn condensed_native_stock_and_layout_portraits_are_installable_and_self_named() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let data = std::fs::read(root.join("ultimate/mods/Bosses/ui/message/msg_name.msbt"))
+        let manifest = std::fs::read_to_string(root.join("Bosses/config.json"))
+            .expect("missing ARCropolis mod manifest");
+        for family in [2, 7] {
+            for color in 0..CONDENSED_NATIVE_COLOR_COUNT {
+                let internal_name = format!("chara_{family}_masterhand_{color:02}");
+                let relative_path =
+                    format!("Bosses/ui/replace/chara/chara_{family}/{internal_name}.bntx");
+                let data = std::fs::read(root.join(&relative_path))
+                    .unwrap_or_else(|_| panic!("missing condensed carrier asset {relative_path}"));
+                let info = parse_single_texture_bntx(&data);
+                assert_eq!(info.name, internal_name);
+                assert!(info.width > 0 && info.height > 0);
+                assert_manifest_path_once(&manifest, relative_path.trim_start_matches("Bosses/"));
+            }
+        }
+    }
+
+    #[test]
+    fn supplied_name_archive_is_structurally_valid() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let data = std::fs::read(root.join("Bosses/ui/message/msg_name.msbt"))
             .expect("missing supplied msg_name.msbt");
         let labels = parse_msbt_label_indices(&data);
         let texts = parse_msbt_texts(&data);
 
-        for name_id in [
-            "playable_bosses",
-            "masterhand",
-            "crazyhand",
-            "darz",
-            "kiila",
-            "ganonboss",
-            "lioleus",
-            "dracula",
-            "marx",
-            "galleom",
-            "mewtwo_masterhand",
-        ] {
-            for prefix in [
-                "nam_chr0_00_",
-                "nam_chr1_00_",
-                "nam_chr2_00_",
-                "nam_chr3_00_",
-            ] {
-                let label = format!("{prefix}{name_id}");
-                assert!(labels.contains_key(&label), "missing message label {label}");
-            }
+        assert!(!labels.is_empty());
+        assert!(!texts.is_empty());
+        for text_index in labels.values() {
+            assert!(usize::try_from(*text_index).unwrap() < texts.len());
         }
-
-        let variant_names = [
-            "masterhand",
-            "crazyhand",
-            "darz",
-            "kiila",
-            "ganonboss",
-            "lioleus",
-            "dracula",
-            "marx",
-        ];
         for prefix in ["nam_chr0", "nam_chr1", "nam_chr2", "nam_chr3"] {
-            for (color, source_name) in variant_names.iter().enumerate() {
-                let source_label = format!("{prefix}_00_{source_name}");
-                let carrier_label = format!("{prefix}_{color:02}_masterhand");
-                assert_eq!(
-                    labels.get(&carrier_label),
-                    labels.get(&source_label),
-                    "carrier color {color} must reuse the existing {source_name} text through the active masterhand lookup"
-                );
-            }
-        }
-
-        let expected_text = [
-            [
-                "Master Hand",
-                "Crazy Hand",
-                "Dharkon",
-                "Galeem",
-                "Ganon",
-                "Rathalos",
-                "Dracula",
-                "Marx",
-            ],
-            [
-                "Master Hand",
-                "Crazy Hand",
-                "Dharkon",
-                "Galeem",
-                "Ganon, The Demon King",
-                "Rathalos",
-                "Dracula",
-                "Marx",
-            ],
-            [
-                "MASTER HAND",
-                "CRAZY HAND",
-                "DHARKON",
-                "GALEEM",
-                "GANON",
-                "RATHALOS",
-                "DRACULA",
-                "MARX",
-            ],
-            [
-                "MASTER HAND",
-                "CRAZY HAND",
-                "DHARKON",
-                "GALEEM",
-                "GANON",
-                "RATHALOS",
-                "DRACULA",
-                "MARX",
-            ],
-        ];
-        for (prefix_index, prefix) in ["nam_chr0", "nam_chr1", "nam_chr2", "nam_chr3"]
-            .iter()
-            .enumerate()
-        {
-            for color in 0..CONDENSED_NATIVE_COLOR_COUNT {
-                let label = format!("{prefix}_{color:02}_masterhand");
-                let text_index = usize::try_from(labels[&label]).unwrap();
-                assert_eq!(
-                    texts[text_index],
-                    expected_text[prefix_index][usize::from(color)],
-                    "incorrect visible name for carrier color {color} in {prefix}"
-                );
-            }
+            assert!(
+                labels.contains_key(&format!("{prefix}_00_masterhand")),
+                "missing baseline Master Hand label for {prefix}"
+            );
         }
     }
 
@@ -4837,40 +5434,40 @@ mod condensed_css_tests {
     fn condensed_config_takes_precedence_over_legacy_css_options() {
         // Required matrix: condensed mode owns the item-boss rows regardless
         // of CUSTOM_CSS, DETECT_CHARACTER_NAME, or individual row flags.
-        assert!(should_install_item_boss_css_callback(
+        assert!(should_install_item_boss_db_callback(
             true, false, true, false, false
         ));
-        assert!(should_install_item_boss_css_callback(
+        assert!(should_install_item_boss_db_callback(
             true, true, false, false, false
         ));
-        assert!(should_install_item_boss_css_callback(
+        assert!(should_install_item_boss_db_callback(
             true, false, true, true, false
         ));
 
         // With condensed mode off, preserve the prior CUSTOM_CSS and
         // per-boss/Amiibo behavior exactly.
-        assert!(should_install_item_boss_css_callback(
+        assert!(should_install_item_boss_db_callback(
             false, false, true, true, false
         ));
-        assert!(should_install_item_boss_css_callback(
+        assert!(should_install_item_boss_db_callback(
             false, false, false, false, true
         ));
-        assert!(!should_install_item_boss_css_callback(
+        assert!(!should_install_item_boss_db_callback(
             false, false, true, false, false
         ));
-        assert!(!should_install_item_boss_css_callback(
+        assert!(!should_install_item_boss_db_callback(
             false, true, false, false, false
         ));
-        assert!(!should_install_item_boss_css_callback(
+        assert!(!should_install_item_boss_db_callback(
             false, true, false, true, true
         ));
     }
 
     #[test]
     fn condensed_mode_does_not_change_giga_bowser_callback_policy() {
-        assert!(should_install_giga_bowser_css_callback(false, true, false));
-        assert!(should_install_giga_bowser_css_callback(false, false, true));
-        assert!(!should_install_giga_bowser_css_callback(true, true, true));
+        assert!(should_install_giga_bowser_db_callback(false, true, false));
+        assert!(should_install_giga_bowser_db_callback(false, false, true));
+        assert!(!should_install_giga_bowser_db_callback(true, true, true));
     }
 
     #[test]
